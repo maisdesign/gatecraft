@@ -88,6 +88,12 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 
 `bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything.
 
+### License
+
+[PolyForm Shield 1.0.0](https://polyformproject.org/licenses/shield/1.0.0) — free to use, modify, and distribute for virtually any purpose, *except* building or running a product that competes with this project or with the licensor's own offerings. See [LICENSE](LICENSE) for the full terms.
+
+If this is useful to you, a mention or link back is appreciated but never required.
+
 ---
 
 ## 🇮🇹 Italiano
@@ -159,6 +165,12 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 - una shell reale (Claude Code CLI o la sua estensione VS Code, o un ambiente equivalente con shell)
 
 `bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa.
+
+### Licenza
+
+[PolyForm Shield 1.0.0](https://polyformproject.org/licenses/shield/1.0.0) — libero da usare, modificare e distribuire per praticamente qualsiasi scopo, *tranne* costruire o gestire un prodotto in concorrenza con questo progetto o con le offerte commerciali del licenziante. Vedi [LICENSE](LICENSE) per il testo completo.
+
+Se questo progetto ti è utile, una menzione o un link sono apprezzati ma mai obbligatori.
 
 ---
 
