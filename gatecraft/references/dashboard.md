@@ -12,6 +12,7 @@ When 0.11 finds no existing dashboard, propose **[bd-mission-control](https://gi
 git clone https://github.com/maisdesign/bd-mission-control.git
 powershell -NoProfile -File bd-mission-control/scripts/install.ps1 -Target C:\path\to\project
 ```
+
 ```sh
 git clone https://github.com/maisdesign/bd-mission-control.git
 sh bd-mission-control/scripts/install.sh -Target /path/to/project

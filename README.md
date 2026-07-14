@@ -35,7 +35,7 @@ Hand a backlog to a swarm of agents and the failure mode is always the same: som
 ### Core ideas
 
 | Principle | What it means in practice |
-|---|---|
+| --- | --- |
 | 🔬 **Verify, don't trust** | The orchestrator re-runs the gate itself, inspects the diff, and does runtime QA. A worker's `bd close` reopens for verification, never short-circuits it. |
 | 🎯 **Gate before dispatch** | A concrete, mechanical definition of done (existing test → targeted script → real-runtime check) is written *before* the worker starts — never a prose task description. |
 | 🧬 **Isolate, then reconcile** | Every bead gets its own worktree; before merge, main is re-integrated and the gate re-runs on the combined result *and* on main itself. |
@@ -51,7 +51,7 @@ The reason is concrete and lives in [`references/codex-quota.md`](gatecraft/refe
 
 ### Repository layout
 
-```
+```text
 gatecraft/                       # the installable unit — copy this whole folder
 ├─ SKILL.md                      # the core protocol (Steps 0–4)
 └─ references/
@@ -113,7 +113,7 @@ Se affidi un backlog a uno sciame di agenti, il modo di fallire è sempre lo ste
 ### Idee portanti
 
 | Principio | Cosa significa in pratica |
-|---|---|
+| --- | --- |
 | 🔬 **Verifica, non fidarti** | L'orchestratore ri-esegue il gate di persona, ispeziona il diff e fa QA runtime. Un `bd close` del worker riapre per verifica, non la scavalca. |
 | 🎯 **Gate prima del dispatch** | Una definizione di "fatto" concreta e meccanica (test esistente → script mirato → check runtime reale) è scritta *prima* che il worker parta — mai una descrizione a parole. |
 | 🧬 **Isola, poi riconcilia** | Ogni bead ha il suo worktree; prima del merge, main viene reintegrato e il gate rigira sul risultato combinato *e* su main stesso. |
@@ -129,7 +129,7 @@ Il motivo è concreto ed è documentato in [`references/codex-quota.md`](gatecra
 
 ### Struttura del repository
 
-```
+```text
 gatecraft/                       # l'unità installabile — copia l'intera cartella
 ├─ SKILL.md                      # il protocollo core (Step 0–4)
 └─ references/

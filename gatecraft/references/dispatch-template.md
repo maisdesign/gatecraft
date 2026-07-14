@@ -2,7 +2,7 @@
 
 Fill every field — an empty or vague field is exactly what produces an unverifiable "looks done" outcome.
 
-```
+```text
 You are: <profile-slug>                     (the worker's canonical bd identity from Step 0.2 —
                                              a worker cannot discover this; the prompt is the only channel)
 Bead: <bead-id> — <one-line title>          (use the project tracker's own prefix, whatever it is)

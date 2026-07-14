@@ -6,7 +6,7 @@
 
 Obtain the orchestrator's own session (~5h) and week (~7d) usage percentages and reset times by feeding `/usage` as **stdin into an interactive `claude` session** — not `--print`, which echoes `/usage` back as literal text. `/exit` and any `sleep` are unnecessary: the session exits on stdin EOF in ~2 s. The robust form polls for the target line with a hard timeout:
 
-```
+```sh
 LOG=<logfile>
 echo "/usage" | CLAUDE_CONFIG_DIR="<profile-config-dir>" claude > "$LOG" 2>&1 &
 BGPID=$!; SECS=0
@@ -20,6 +20,7 @@ Either `claude` with `CLAUDE_CONFIG_DIR` set (confirmed — no wrapper needed) o
 **Best-effort, not guaranteed (lived, verified by repeated testing).** The `Current session:` / `Current week:` percentage lines render on the first calls but **intermittently vanish on rapid repeated invocations** (suspected server-side throttling on the summary fetch) — independent of sleep length, pipe-vs-file, or profile — while the "What's contributing to your limits usage?" section always prints. So query **at most once per bead cycle** (the required cadence; never poll tightly — that is exactly what triggers the vanishing), and treat a **missing percentage line as "no reading this cycle," not as 0% and not as a stop** — retry next cycle or use the non-blocking fallback below. Codex has a *structured* channel that is cleaner than this scrape — JSON-RPC `account/rateLimits/read` over `codex app-server --stdio` (see `codex-quota.md`).
 
 Exact lines to parse:
+
 - `Current session: {N}% used · resets {Mon} {DD}, {h}[:{mm}]{am|pm} ({TZ})`
 - `Current week (all models): {N}% used · resets {Mon} {DD}, {h}[:{mm}]{am|pm} ({TZ})`
 
@@ -87,7 +88,7 @@ A cold successor under any profile loads it through `bd prime`/`bd memories` rat
 
 The verification comment leads with one machine-greppable ledger line. A pass and a failure use **different prefixes** — never a shared `VERIFIED` prefix distinguished only by a `result=` field, or a grep for verification counts a failure as evidence of one:
 
-```
+```text
 VERIFIED            verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=0   result=pass
 VERIFICATION_FAILED verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=<n> result=fail
 ```
