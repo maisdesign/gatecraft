@@ -81,7 +81,11 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $contractPath = Join-Path $repoRoot 'gatecraft/references/execution-contract.md'
 $hygienePath = Join-Path $repoRoot 'gatecraft/references/evidence-hygiene.md'
 $receiptProtocolPath = Join-Path $repoRoot 'gatecraft/references/receipt-protocol.md'
+$cycleEndReferencePath = Join-Path $repoRoot 'gatecraft/references/cycle-end.md'
 $protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
+$cycleEndScriptPath = Join-Path $repoRoot 'gatecraft/scripts/cycle-end.ps1'
+$cycleEndShellPath = Join-Path $repoRoot 'gatecraft/scripts/cycle-end.sh'
+$cycleEndTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-CycleEnd.ps1'
 $receiptTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-ReceiptProtocol.ps1'
 $skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
 $dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
@@ -93,7 +97,11 @@ $gitignorePath = Join-Path $repoRoot '.gitignore'
 $contract = Read-RequiredText -Path $contractPath -Label 'Normative execution contract'
 $hygiene = Read-RequiredText -Path $hygienePath -Label 'Raw-log hygiene reference'
 $receiptProtocol = Read-RequiredText -Path $receiptProtocolPath -Label 'Receipt protocol reference'
+$cycleEndReference = Read-RequiredText -Path $cycleEndReferencePath -Label 'Cycle-end reference'
 $protocolModule = Read-RequiredText -Path $protocolModulePath -Label 'Receipt protocol module'
+$cycleEndScript = Read-RequiredText -Path $cycleEndScriptPath -Label 'Cycle-end PowerShell entry point'
+$cycleEndShell = Read-RequiredText -Path $cycleEndShellPath -Label 'Cycle-end POSIX entry point'
+$cycleEndTest = Read-RequiredText -Path $cycleEndTestPath -Label 'Cycle-end behavioral gate'
 $receiptTest = Read-RequiredText -Path $receiptTestPath -Label 'Receipt protocol behavioral gate'
 $skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
 $dispatch = Read-RequiredText -Path $dispatchPath -Label 'Dispatch template'
@@ -201,6 +209,41 @@ Assert-Match -Text $contract -Pattern 'mandatory stable worker identity on every
 Assert-Match -Text $contract -Pattern 'increment total-spawn state only after accepting that identity-bound spawn' -Message 'GC-1.7 must account only accepted identity-bound spawns.'
 Assert-Match -Text $contract -Pattern 'emit one integration/premerge receipt' -Message 'GC-1.10 must emit the integration receipt before review.'
 Assert-Match -Text $contract -Pattern 'Validate the ordered verification/v2 chain with Gatecraft\.Protocol\.psm1' -Message 'GC-1.11 must validate the real receipt chain.'
+Assert-Match -Text $contract -Pattern 'Append exactly one `cycle-end` event.+stable event ID.+strictly monotonic positive sequence' -Message 'GC-1.12 must invoke one stable, monotonic cycle-end event.'
+Assert-Match -Text $contract -Pattern 'append-only canonical receipt first.+derive the session-log, heartbeat, snapshot, and dashboard projections only from the validated receipt sequence' -Message 'GC-1.12 must make the receipt authoritative over every projection.'
+Assert-Match -Text $contract -Pattern 'unattended mode fails closed.+attended mode may expose only the documented `automatic_completion=false` manual checklist' -Message 'GC-1.12 must preserve visible mode-specific projection failure behavior.'
+
+# Receipt-first cycle-end implementation, entry points, and recovery gate.
+Assert-Match -Text $skill -Pattern 'references/cycle-end\.md' -Message 'SKILL.md must route cycle-end behavior to the focused reference.'
+Assert-Match -Text $skill -Pattern 'append-only canonical receipt as the only source of truth.+session-log, heartbeat, snapshot, and dashboard files only as rebuildable projections' -Message 'SKILL.md must retain the cycle-end authority boundary inline.'
+Assert-Match -Text $skill -Pattern 'Only exit 0 with `projections=complete` completes the boundary' -Message 'SKILL.md must retain the visible cycle completion condition.'
+Assert-Match -Text $cycleEndReference -Pattern '(?m)^# Cycle-end event \(`gatecraft-cycle/v1`\)' -Message 'Cycle-end reference must declare the versioned event.'
+Assert-Match -Text $cycleEndReference -Pattern 'same ID with different canonical fields, a sequence already owned by another ID, every gap' -Message 'Cycle-end reference must define all three identity/sequence conflicts.'
+Assert-Match -Text $cycleEndReference -Pattern 'not a cooperative lock and are not race-proof against concurrent path replacement' -Message 'Cycle-end reference must state its honest no-lock filesystem boundary.'
+Assert-Match -Text $cycleEndReference -Pattern 'GATECRAFT_CYCLE_END_TEST_CONTROLS.+exact value.+1.+before state-root initialization or persistence' -Message 'Cycle-end reference must document the exact test-control environment gate and pre-write rejection.'
+Assert-Match -Text $cycleEndReference -Pattern 'Only exit 0 plus `CYCLE_END_COMPLETE \.\.\. projections=complete` means automatic completion' -Message 'Cycle-end reference must distinguish completion from fallback.'
+Assert-Match -Text $cycleEndScript -Pattern '\[IO\.File\]::Move\(\$temporary, \$Path, \$false\)' -Message 'Canonical receipt installation must be create-only.'
+Assert-Match -Text $cycleEndScript -Pattern "receiptDisposition = 'replayed'" -Message 'Cycle-end implementation must expose idempotent replay.'
+Assert-Match -Text $cycleEndScript -Pattern "(?s)GATECRAFT_CYCLE_END_TEST_CONTROLS.+-cne '1'.+test-controls-disabled:.+Initialize-StateRoot" -Message 'Cycle-end implementation must reject test controls unless the exact environment opt-in is present before state initialization.'
+foreach ($boundary in @('receipt', 'session-log', 'heartbeat', 'snapshot', 'dashboard')) {
+    Assert-Match -Text $cycleEndScript -Pattern ([regex]::Escape("after-$boundary")) -Message "Cycle-end implementation is missing failpoint after-$boundary."
+    Assert-Match -Text $cycleEndTest -Pattern ([regex]::Escape("after-$boundary")) -Message "Cycle-end behavioral gate is missing kill/replay coverage after-$boundary."
+}
+Assert-Match -Text $cycleEndScript -Pattern 'CYCLE_END_MANUAL_FALLBACK.+automatic_completion=false' -Message 'Attended projection failure must remain visibly incomplete.'
+Assert-Match -Text $cycleEndScript -Pattern 'Unattended mode fails closed' -Message 'Unattended projection failure must fail closed.'
+Assert-Match -Text $cycleEndShell -Pattern '(?m)^#!/bin/sh\s*$' -Message 'Cycle-end shell entry point must use a POSIX shell.'
+Assert-Match -Text $cycleEndShell -Pattern 'exec pwsh -NoLogo -NoProfile -File "\$script_dir/cycle-end\.ps1" "\$@"' -Message 'Cycle-end shell entry point must preserve arguments and the real exit code.'
+Assert-Match -Text $cycleEndTest -Pattern '\$IsWindows' -Message 'Cycle-end gate must branch explicitly by platform.'
+Assert-Match -Text $cycleEndTest -Pattern 'C:\\Program Files\\Git\\bin\\bash\.exe' -Message 'Cycle-end gate must require the exact Git for Windows Bash binary on Windows.'
+Assert-Match -Text $cycleEndTest -Pattern 'Get-Command -Name bash -CommandType Application' -Message 'Cycle-end gate must resolve bash as an Application from PATH on non-Windows platforms.'
+Assert-Match -Text $cycleEndTest -Pattern '\$bash = \$bashCommand\.Source' -Message 'Cycle-end gate must invoke the exact non-Windows Bash executable resolved from PATH.'
+Assert-Match -Text $cycleEndTest -Pattern 'GATECRAFT_CYCLE_END_TEST_CONTROLS' -Message 'Cycle-end behavioral gate must name the test-control environment opt-in.'
+Assert-Match -Text $cycleEndTest -Pattern '(?s)GetEnvironmentVariable\(\$testControlsEnvironmentVariable.+finally\s*\{.+SetEnvironmentVariable\(\$testControlsEnvironmentVariable, \$previousValue' -Message 'Cycle-end behavioral gate must restore any pre-existing test-control environment value in finally.'
+Assert-Match -Text $cycleEndTest -Pattern 'Invoke-WithTestControlsEnvironment -Enabled \$false' -Message 'Cycle-end behavioral gate must exercise production rejection with the test-control opt-in absent.'
+Assert-Match -Text $cycleEndTest -Pattern 'WaitForExit\(\$TimeoutMilliseconds\)' -Message 'Cycle-end production-rejection fixture must enforce a hard timeout.'
+Assert-Match -Text $cycleEndTest -Pattern 'ProcessStartInfo' -Message 'Cycle-end gate must use real child processes for interruption fixtures.'
+Assert-Match -Text $cycleEndTest -Pattern 'Kill\(\$true\)' -Message 'Cycle-end gate must kill the exact failpoint child process tree.'
+Assert-Match -Text $cycleEndTest -Pattern 'Refuse fixture cleanup outside the exact unique temp root' -Message 'Cycle-end gate must verify cleanup targets before deletion.'
 
 $receiptLineCount = @($receiptProtocol -split '\r?\n').Count
 Assert-True -Condition ($receiptLineCount -gt 100) -Message 'Receipt protocol must use the requested detailed progressive-disclosure reference.'
@@ -245,6 +288,8 @@ Assert-Match -Text $receiptTest -Pattern "New-Item -ItemType SymbolicLink" -Mess
 
 foreach ($powerShellSource in @(
     [pscustomobject]@{ Label = 'Gatecraft.Protocol.psm1'; Text = $protocolModule },
+    [pscustomobject]@{ Label = 'cycle-end.ps1'; Text = $cycleEndScript },
+    [pscustomobject]@{ Label = 'Test-CycleEnd.ps1'; Text = $cycleEndTest },
     [pscustomobject]@{ Label = 'Test-ReceiptProtocol.ps1'; Text = $receiptTest }
 )) {
     $tokens = $null
@@ -516,6 +561,7 @@ Assert-Match -Text $changelog -Pattern 'Five findings folded in from two orchest
 Assert-Match -Text $changelog -Pattern 'Renamed .+ to Gatecraft, published under a fresh public repository' -Message 'Historical 2026-07-13 wording anchor is missing.'
 Assert-Match -Text $changelog -Pattern 'Contract-first foundation and five approved tweaks' -Message 'The substantive contract-first change must be appended to 2026-07-15.'
 Assert-Match -Text $changelog -Pattern 'Verification v2, review receipts, and retry classes' -Message 'The verification/v2 revision must amend the current 2026-07-15 entry.'
+Assert-Match -Text $changelog -Pattern 'Receipt-first cycle-end MVP' -Message 'The cycle-end MVP revision must amend the current 2026-07-15 entry.'
 
 # Raw-log ignore boundary and documentation.
 foreach ($pattern in @('log/', '/logs/', '/.llm/runtime/', '/.gatecraft/', '*.attempt-*.log', '*.raw-session.*')) {
@@ -563,14 +609,16 @@ if ($italianMatch.Success) {
 Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
 Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
 foreach ($newFile in @(
-    'execution-contract.md', 'evidence-hygiene.md', 'receipt-protocol.md',
-    'Gatecraft.Protocol.psm1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
+    'execution-contract.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md',
+    'Gatecraft.Protocol.psm1', 'cycle-end.ps1', 'cycle-end.sh',
+    'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
 )) {
     $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
     Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
 }
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract\.ps1')).Count -ge 2) -Message 'README must give the exact maintainer gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact receipt gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd\.ps1')).Count -ge 2) -Message 'README must give the exact cycle-end gate command in both languages.'
 
 if ($failures.Count -gt 0) {
     [Console]::Error.WriteLine("Protocol contract gate failed with $($failures.Count) issue(s):")

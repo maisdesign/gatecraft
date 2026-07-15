@@ -88,6 +88,12 @@ Persist through both `bd remember` and a relevant epic/tracking-bead comment:
 
 A cold successor under any profile loads it through `bd prime`/`bd memories` rather than re-deriving work. The `bd remember` copy is **authoritative**; the comment is a human-readable mirror that never overrides it. `snapshot_seq` is a divergence *detector*, not a conflict *resolver* — because the two writes are not atomic and concurrent writers can mint the same seq or leave a mirror ahead of the authoritative copy, a reader that finds them disagreeing does **not** silently take the higher seq: it treats the disagreement as a real conflict and fail-closes (stop, involve a human), and never auto-takes over across hosts on an ambiguous snapshot.
 
+## Cycle-end call site and fallback
+
+After the GC-1.11 ledger/status update, invoke the single `cycle-end` event described in `cycle-end.md`. Its local canonical receipt is authoritative only for rebuilding the local session-log, heartbeat, snapshot, and dashboard projections; it does **not** replace the `bd remember` handoff snapshot, its comment mirror, or the lock holder's existing heartbeat/acquisition semantics above. Pass the next event sequence and a stable ID, and replay that exact payload after interruption. Do not claim another bead until the command exits zero with `projections=complete`.
+
+If projection cannot complete, unattended mode stops nonzero. Attended mode may print the documented `automatic_completion=false` manual checklist, but that checklist is recovery guidance rather than ACK, lock acquisition, or cycle completion. Manual reconstruction must read only the canonical cycle-end receipts and must remain visibly incomplete until the exact replay succeeds or the operator explicitly records the manual state.
+
 ## Verification ledger format (Step 1.11)
 
 Lead the verification comment with one machine-greppable line. Apply the exact verification/v2 grammar, review state rules, canonical fingerprint, and decision procedure in `receipt-protocol.md`; validate it with `scripts/Gatecraft.Protocol.psm1` before close or publication.
