@@ -56,6 +56,7 @@ gatecraft/                       # the installable unit — copy this whole fold
 ├─ SKILL.md                      # core protocol, inline safety invariants, contract routing
 ├─ references/
 │  ├─ execution-contract.md      # normative GC-0.0…GC-1.12 records
+│  ├─ receipt-protocol.md        # verification/v2 receipts, hashing, review, retry rules
 │  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
 │  ├─ dispatch-template.md       # the fill-every-field worker prompt
 │  ├─ anti-patterns.md           # lived failures → the rules that prevent them
@@ -64,7 +65,10 @@ gatecraft/                       # the installable unit — copy this whole fold
 │  ├─ codex-quota.md             # copyable PowerShell usage adapters
 │  ├─ dashboard.md               # recommended dashboard tool + incident detail
 │  └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
+├─ scripts/
+│  └─ Gatecraft.Protocol.psm1    # deterministic parser, validator, hasher, sanitizer, retry state
 └─ tests/
+   ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
    └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
 ~~~
@@ -94,9 +98,10 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 
 ### Maintenance
 
-Before committing any change to the skill or its references, maintainers must run the protocol contract gate from the repository root:
+Before committing any change to the skill or its references, maintainers must run both dependency-free protocol gates from the repository root:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 ```
 
@@ -146,6 +151,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 ├─ SKILL.md                      # protocollo core, invarianti inline, routing al contratto
 ├─ references/
 │  ├─ execution-contract.md      # record normativi GC-0.0…GC-1.12
+│  ├─ receipt-protocol.md        # ricevute verification/v2, hash, review e retry
 │  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
 │  ├─ dispatch-template.md       # prompt worker con ogni campo da compilare
 │  ├─ anti-patterns.md           # fallimenti vissuti → regole preventive
@@ -154,7 +160,10 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 │  ├─ codex-quota.md             # adapter PowerShell copiabili per l'uso
 │  ├─ dashboard.md               # dashboard consigliata + dettaglio incidenti
 │  └─ wordpress.md               # checklist WordPress + incidente sandbox Windows
+├─ scripts/
+│  └─ Gatecraft.Protocol.psm1    # parser, validatore, hash, sanitizzazione e retry deterministici
 └─ tests/
+   ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
    └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
 ~~~
@@ -184,9 +193,10 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 
 ### Manutenzione
 
-Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire il gate del contratto del protocollo dalla root del repository:
+Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire entrambi i gate del protocollo senza dipendenze dalla root del repository:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 ```
 

@@ -77,6 +77,8 @@ Persist through both `bd remember` and a relevant epic/tracking-bead comment:
 - active worktrees and branch names;
 - the bead tied to each and its status (canonical bead-status vocabulary — defined once in `SKILL.md` Step 1);
 - each in-flight Step 2 gate;
+- each reserved attempt ID, consumed task-attempt count, and total-spawn count;
+- each baseline, integration/premerge, and review receipt ID already emitted for the active artifact;
 - pending user decisions;
 - `reclaim_at`;
 - intended successor;
@@ -88,11 +90,10 @@ A cold successor under any profile loads it through `bd prime`/`bd memories` rat
 
 ## Verification ledger format (Step 1.11)
 
-The verification comment leads with one machine-greppable ledger line. A pass and a failure use **different prefixes** — never a shared `VERIFIED` prefix distinguished only by a `result=` field, or a grep for verification counts a failure as evidence of one:
+Lead the verification comment with one machine-greppable line. Apply the exact verification/v2 grammar, review state rules, canonical fingerprint, and decision procedure in `receipt-protocol.md`; validate it with `scripts/Gatecraft.Protocol.psm1` before close or publication.
 
-```text
-VERIFIED            verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=0   result=pass
-VERIFICATION_FAILED verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=<n> result=fail
-```
+Preserve the legacy boundary. Start only the final postmerge pass with `VERIFIED`, keep `verified_by`, `verified_at`, `commit`, `main`, `gate`, `exit=0`, and `result=pass`, and confirm it matches `^VERIFIED\b.*result=pass`. Start baseline and integration/premerge support with `VERIFY_PHASE` so legacy consumers cannot count them as final proof.
 
-Only a `VERIFIED … result=pass` line is durable evidence that the orchestrator ran Step 1.8 successfully; `VERIFICATION_FAILED` records that a check ran and did not pass. Bead closure is a status, not proof — the ledger line is the proof, bound to the exact `commit`, the `main` SHA it was gated against, the gate command, and its exit code. Step 0.12 reconstructs the verified set by grepping only `VERIFIED … result=pass` lines.
+Record a failed final check with the distinct legacy failure prefix `VERIFICATION_FAILED … result=fail`; do not feed that failure ledger line into a candidate pass chain. Treat it as an audit record of the failed decision. Never rename it to `VERIFIED`, and never let closure substitute for a validated final pass.
+
+Sanitize the full validator result before copying its minimal reason codes or receipt projection into `bd`, a handoff snapshot mirror, or a dashboard. Carry the referenced baseline, integration, and terminal review receipt IDs in handoff evidence so a cold successor can reconstruct the exact chain rather than grepping for an unlinked favorable line.

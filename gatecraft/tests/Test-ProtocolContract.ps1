@@ -80,6 +80,9 @@ function Read-RequiredText {
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $contractPath = Join-Path $repoRoot 'gatecraft/references/execution-contract.md'
 $hygienePath = Join-Path $repoRoot 'gatecraft/references/evidence-hygiene.md'
+$receiptProtocolPath = Join-Path $repoRoot 'gatecraft/references/receipt-protocol.md'
+$protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
+$receiptTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-ReceiptProtocol.ps1'
 $skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
 $dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
 $quotaPath = Join-Path $repoRoot 'gatecraft/references/codex-quota.md'
@@ -89,6 +92,9 @@ $gitignorePath = Join-Path $repoRoot '.gitignore'
 
 $contract = Read-RequiredText -Path $contractPath -Label 'Normative execution contract'
 $hygiene = Read-RequiredText -Path $hygienePath -Label 'Raw-log hygiene reference'
+$receiptProtocol = Read-RequiredText -Path $receiptProtocolPath -Label 'Receipt protocol reference'
+$protocolModule = Read-RequiredText -Path $protocolModulePath -Label 'Receipt protocol module'
+$receiptTest = Read-RequiredText -Path $receiptTestPath -Label 'Receipt protocol behavioral gate'
 $skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
 $dispatch = Read-RequiredText -Path $dispatchPath -Label 'Dispatch template'
 $quota = Read-RequiredText -Path $quotaPath -Label 'Quota adapter reference'
@@ -115,7 +121,7 @@ Assert-True -Condition (($actualIds -join '|') -ceq (@($expectedIds) -join '|'))
 Assert-Match -Text $contract -Pattern '(?m)^### GC-0\.0\b.*\bBLOCKING\b' -Message 'GC-0.0 must be visibly marked BLOCKING.'
 
 $triggerVerbs = 'Begin|Continue|Complete|Prepare|Enter|Select|Launch|Verify|Evaluate|Record|Finish'
-$actionVerbs = 'Create|Check|Enumerate|Detect|Persist|Declare|Obtain|Designate|Compare|Select|Fill|Match|Set|Inspect|Pause|Apply|Lead|Append|Ask|Verify'
+$actionVerbs = 'Create|Check|Enumerate|Detect|Persist|Declare|Obtain|Designate|Compare|Select|Fill|Match|Set|Inspect|Pause|Apply|Lead|Append|Ask|Verify|Validate'
 foreach ($record in $records) {
     $id = $record.Groups['id'].Value
     $body = $record.Groups['body'].Value
@@ -176,10 +182,82 @@ Assert-Match -Text $skill -Pattern 'Never launch a dispatched worker with an ele
 Assert-Match -Text $skill -Pattern '\*\*Fail-closed:\*\*' -Message 'SKILL.md must retain fail-closed lock handling inline.'
 Assert-Match -Text $skill -Pattern 'Independently run the Step 2 gate' -Message 'SKILL.md must retain independent verification inline.'
 Assert-Match -Text $skill -Pattern 'Ask before installing software, deploying to staging/production, destructive git operations' -Message 'SKILL.md must retain ask-before catastrophic-risk actions inline.'
-Assert-Match -Text $skill -Pattern 'A red baseline blocks \*unattended\* merge' -Message 'SKILL.md must retain the unattended red-baseline stop inline.'
+Assert-Match -Text $skill -Pattern 'A red baseline never authorizes itself' -Message 'SKILL.md must retain the non-self-authorizing red-baseline boundary inline.'
+Assert-Match -Text $skill -Pattern 'baseline-expected-gap.+standing policy or terminal scope explicitly authorizes that named gap' -Message 'SKILL.md must retain the persisted unattended named-gap authority boundary inline.'
 Assert-Match -Text $skill -Pattern 'Record the pre-merge .?main.? SHA first' -Message 'SKILL.md must retain constrained post-merge rollback handling inline.'
 Assert-Match -Text $skill -Pattern 'VERIFIED .+ result=pass.+VERIFICATION_FAILED .+ result=fail' -Message 'SKILL.md must retain backward-compatible verification ledger wording inline.'
 Assert-Match -Text $skill -Pattern 'allow only sanitized evidence to become durable/shared/public' -Message 'SKILL.md must retain the raw-evidence publication boundary inline.'
+
+# Verification/v2 progressive-disclosure routing and production artifacts.
+Assert-Match -Text $skill -Pattern 'references/receipt-protocol\.md' -Message 'SKILL.md must route explicitly to the receipt protocol.'
+Assert-Match -Text $skill -Pattern 'scripts/Gatecraft\.Protocol\.psm1' -Message 'SKILL.md must route deterministic validation to the production module.'
+Assert-Match -Text $skill -Pattern 'exactly one valid baseline observation .+ actual unsigned decimal exit.+baseline-expected-gap.+integration/premerge pass, exact-artifact admissible review, and postmerge pass' -Message 'SKILL.md must retain the fail-closed verification/v2 hot path including the nonzero-baseline marker.'
+Assert-Match -Text $skill -Pattern 'never exceed three total spawns' -Message 'SKILL.md must retain the global worker-spawn cap.'
+Assert-Match -Text $contract -Pattern 'separate task-attempt and total-spawn counts' -Message 'Execution contract must keep retry counters distinct.'
+Assert-Match -Text $contract -Pattern 'emit exactly one valid verification/v2 .?phase=baseline result=observed.? receipt with the actual unsigned decimal exit code' -Message 'GC-1.4 must emit the baseline observation with its actual unsigned exit.'
+Assert-Match -Text $contract -Pattern 'direct user authority persisted before dispatch' -Message 'GC-1.4 must bind the nonzero-baseline marker to prior direct user authority.'
+Assert-Match -Text $contract -Pattern 'standing policy or terminal scope explicitly authorizes the named gap' -Message 'GC-1.4 must permit unattended red only for the persisted named gap.'
+Assert-Match -Text $contract -Pattern 'mandatory stable worker identity on every spawn' -Message 'GC-0.5 must declare identity binding for every spawn.'
+Assert-Match -Text $contract -Pattern 'increment total-spawn state only after accepting that identity-bound spawn' -Message 'GC-1.7 must account only accepted identity-bound spawns.'
+Assert-Match -Text $contract -Pattern 'emit one integration/premerge receipt' -Message 'GC-1.10 must emit the integration receipt before review.'
+Assert-Match -Text $contract -Pattern 'Validate the ordered verification/v2 chain with Gatecraft\.Protocol\.psm1' -Message 'GC-1.11 must validate the real receipt chain.'
+
+$receiptLineCount = @($receiptProtocol -split '\r?\n').Count
+Assert-True -Condition ($receiptLineCount -gt 100) -Message 'Receipt protocol must use the requested detailed progressive-disclosure reference.'
+Assert-Match -Text $receiptProtocol -Pattern '(?m)^## Table of contents\s*$' -Message 'Receipt protocol exceeds 100 lines and must contain a table of contents.'
+foreach ($heading in @(
+    'Parse the receipt grammar', 'Resolve review receipts', 'Decide the final pass',
+    'Bind content canonically', 'Classify retries post hoc', 'Enforce the retry state machine',
+    'Sanitize receipt-derived output', 'Follow the examples', 'Operate and diagnose safely'
+)) {
+    Assert-Match -Text $receiptProtocol -Pattern ('(?m)^## ' + [regex]::Escape($heading) + '\s*$') -Message "Receipt protocol is missing detailed section '$heading'."
+}
+Assert-Match -Text $receiptProtocol -Pattern '\^VERIFIED\\b\.\*result=pass' -Message 'Receipt protocol must preserve the historic bd-mission-control regex.'
+Assert-Match -Text $receiptProtocol -Pattern 'phase=baseline.+exit=<unsigned-decimal> result=observed' -Message 'Receipt protocol must define baseline as an observation with the actual unsigned exit.'
+Assert-Match -Text $receiptProtocol -Pattern 'verification\.baseline-expected-gap-missing' -Message 'Receipt protocol must define the stable missing-marker reason.'
+Assert-Match -Text $receiptProtocol -Pattern '\[A-Za-z0-9\]\[A-Za-z0-9\._:/@\+-\]\{0,127\}' -Message 'Receipt protocol must define the mandatory stable worker identity token.'
+Assert-Match -Text $receiptProtocol -Pattern 'retry\.worker-id-invalid.+before incrementing `TotalSpawnCount` or awaiting an outcome' -Message 'Receipt protocol must reject invalid worker identity before spawn acceptance.'
+Assert-Match -Text $protocolModule -Pattern 'verification\.baseline-expected-gap-missing' -Message 'Production validation must expose the stable missing expected-gap reason.'
+Assert-Match -Text $protocolModule -Pattern 'retry\.worker-id-invalid' -Message 'Production retry validation must expose the stable invalid-worker reason.'
+Assert-Match -Text $receiptTest -Pattern 'nonzero baseline without expected-gap marker' -Message 'Behavioral fixtures must reject an unmarked nonzero baseline.'
+Assert-Match -Text $receiptTest -Pattern 'zero baseline token with no expected-gap marker must pass' -Message 'Behavioral fixtures must admit a marker-free zero baseline.'
+Assert-Match -Text $receiptTest -Pattern 'spawn missing worker identity fails closed before acceptance' -Message 'Behavioral fixtures must reject a missing worker identity before acceptance.'
+Assert-Match -Text $receiptTest -Pattern 'spawn malformed worker identity fails closed before acceptance' -Message 'Behavioral fixtures must reject a malformed worker identity before acceptance.'
+Assert-Match -Text $receiptProtocol -Pattern 'cannot discover an append-only block that a caller omitted' -Message 'Receipt protocol must state the cooperative complete-chain collection limit.'
+Assert-Match -Text $receiptProtocol -Pattern 'not race-proof against a concurrent path replacement' -Message 'Receipt protocol must state the honest local filesystem race boundary.'
+Assert-Match -Text $receiptProtocol -Pattern 'path<TAB>lowercase_hash' -Message 'Receipt protocol must state the canonical aggregate payload line.'
+Assert-Match -Text $receiptProtocol -Pattern 'add no trailing LF' -Message 'Receipt protocol must state the no-trailing-LF rule.'
+Assert-Match -Text $receiptProtocol -Pattern '4BEEAD1964F03EED66D1FCB23A90E9BC6125EBDA822098211FA7102F56CE6418' -Message 'Receipt protocol must carry the fixed aggregate fixture.'
+
+foreach ($functionName in @(
+    'Protect-GatecraftText', 'ConvertFrom-GatecraftReceiptLine',
+    'Test-GatecraftVerificationChain', 'ConvertTo-GatecraftDashboardProjection',
+    'Get-GatecraftAggregateFingerprint', 'Resolve-GatecraftRetrySequence'
+)) {
+    Assert-Match -Text $protocolModule -Pattern ('(?m)^function ' + [regex]::Escape($functionName) + '\s*\{') -Message "Protocol module is missing $functionName."
+    Assert-Match -Text $receiptTest -Pattern ([regex]::Escape($functionName)) -Message "Behavioral gate must exercise $functionName."
+}
+Assert-Match -Text $receiptTest -Pattern 'Import-Module \$modulePath -Force' -Message 'Receipt gate must import the real production module.'
+Assert-NotMatch -Text $receiptTest -Pattern '(?m)^function (?:Test-GatecraftVerificationChain|Get-GatecraftAggregateFingerprint|Resolve-GatecraftRetrySequence)\s*\{' -Message 'Receipt gate must not duplicate production parser/hash/retry logic.'
+Assert-NotMatch -Text $protocolModule -Pattern '(?i)\b(?:Get-Date|New-Guid|Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer)\b|DateTime(?:Offset)?\]::(?:Now|UtcNow)' -Message 'Protocol validation module must not use time, randomness, or network access.'
+Assert-Match -Text $receiptTest -Pattern "New-Item -ItemType Junction" -Message 'Behavioral gate must exercise an intermediate Windows junction.'
+Assert-Match -Text $receiptTest -Pattern "New-Item -ItemType SymbolicLink" -Message 'Behavioral gate must exercise the POSIX symbolic-link equivalent where supported.'
+
+foreach ($powerShellSource in @(
+    [pscustomobject]@{ Label = 'Gatecraft.Protocol.psm1'; Text = $protocolModule },
+    [pscustomobject]@{ Label = 'Test-ReceiptProtocol.ps1'; Text = $receiptTest }
+)) {
+    $tokens = $null
+    $parseErrors = $null
+    [void] [Management.Automation.Language.Parser]::ParseInput(
+        $powerShellSource.Text,
+        [ref] $tokens,
+        [ref] $parseErrors
+    )
+    foreach ($parseError in @($parseErrors)) {
+        Add-Failure "$($powerShellSource.Label) has a syntax error at '$($parseError.Extent.Text)': $($parseError.Message)"
+    }
+}
 
 # Absolute worktree template with both platform rules.
 Assert-Match -Text $dispatch -Pattern '(?m)^Worktree: <absolute-worktree-path> on branch work/<id>-a<n>' -Message 'Dispatch template Worktree field must use <absolute-worktree-path>.'
@@ -437,6 +515,7 @@ Assert-Match -Text $changelog -Pattern 'Harvest from Menu-Nomade session 7''s lo
 Assert-Match -Text $changelog -Pattern 'Five findings folded in from two orchestration sessions on OrizzonteDiploma' -Message 'Historical 2026-07-14 wording anchor is missing.'
 Assert-Match -Text $changelog -Pattern 'Renamed .+ to Gatecraft, published under a fresh public repository' -Message 'Historical 2026-07-13 wording anchor is missing.'
 Assert-Match -Text $changelog -Pattern 'Contract-first foundation and five approved tweaks' -Message 'The substantive contract-first change must be appended to 2026-07-15.'
+Assert-Match -Text $changelog -Pattern 'Verification v2, review receipts, and retry classes' -Message 'The verification/v2 revision must amend the current 2026-07-15 entry.'
 
 # Raw-log ignore boundary and documentation.
 foreach ($pattern in @('log/', '/logs/', '/.llm/runtime/', '/.gatecraft/', '*.attempt-*.log', '*.raw-session.*')) {
@@ -454,6 +533,8 @@ Assert-Match -Text $hygiene -Pattern 'Do not perform direct database surgery' -M
 Assert-Match -Text $hygiene -Pattern 'sanitized projection can exclude it or replace it with the typed-marker correction' -Message 'Tainted durable evidence must block unsanitized projection.'
 Assert-Match -Text $hygiene -Pattern 'Allow only sanitized evidence across the durable/shared/public boundary' -Message 'Evidence hygiene must allow only sanitized durable/shared/public evidence.'
 Assert-Match -Text $hygiene -Pattern 'Never publish or commit a raw session log, attempt log, native transcript, local runtime state' -Message 'Evidence hygiene must forbid durable/public raw logs and runtime state.'
+Assert-Match -Text $hygiene -Pattern 'Pass the same known-value table to `Test-GatecraftVerificationChain`' -Message 'Evidence hygiene must route sanitized validation through the production module.'
+Assert-Match -Text $hygiene -Pattern 'Keep `ConvertFrom-GatecraftReceiptLine` output local/raw' -Message 'Evidence hygiene must keep raw parser output behind the boundary.'
 Assert-Match -Text $contract -Pattern 'user-approved project \.gitignore rule.+local \.git/info/exclude.+outside the repository' -Message 'GC-0.0 must define a non-silent target-repository ignore mechanism.'
 Assert-Match -Text $skill -Pattern 'without silently editing the user''s tracked `\.gitignore`' -Message 'SKILL.md must retain the target-repository ignore boundary inline.'
 Assert-Match -Text (Read-RequiredText -Path (Join-Path $repoRoot 'gatecraft/references/handoff-protocol.md') -Label 'Handoff protocol') -Pattern 'tiers below apply only when a trustworthy short-session value is available' -Message 'Handoff tiers must never use weekly-only usage.'
@@ -481,11 +562,15 @@ if ($italianMatch.Success) {
 }
 Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
 Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
-foreach ($newFile in @('execution-contract.md', 'evidence-hygiene.md', 'Test-ProtocolContract.ps1')) {
+foreach ($newFile in @(
+    'execution-contract.md', 'evidence-hygiene.md', 'receipt-protocol.md',
+    'Gatecraft.Protocol.psm1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
+)) {
     $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
     Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
 }
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract\.ps1')).Count -ge 2) -Message 'README must give the exact maintainer gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact receipt gate command in both languages.'
 
 if ($failures.Count -gt 0) {
     [Console]::Error.WriteLine("Protocol contract gate failed with $($failures.Count) issue(s):")

@@ -29,6 +29,16 @@ Apply this boundary to the GC-0.0 session log, GC-1.7 attempt logs, native agent
 - Record an explicit sanitization check beside the durable evidence.
 - Treat a missing or uncertain redaction result as a stop condition and keep the evidence local.
 
+## Apply the deterministic protocol boundary
+
+- Import `scripts/Gatecraft.Protocol.psm1` under PowerShell 7 or later before emitting receipt-derived or dashboard-safe output.
+- Pass already-known values to `Protect-GatecraftText` with a non-secret type label and replace exact values with typed markers such as `[REDACTED_TOKEN]`; never read a secret file merely to populate the replacement table.
+- Pass the same known-value table to `Test-GatecraftVerificationChain` so its machine result and validation errors contain sanitized receipt fields.
+- Build dashboard JSON only with `ConvertTo-GatecraftDashboardProjection`, then re-sanitize that projection before writing it.
+- Keep `ConvertFrom-GatecraftReceiptLine` output local/raw; never publish parser fields directly.
+- Treat deterministic exact-value replacement as one boundary control, not secret discovery; retain the broader scanning, access, retention, and wrapper-level controls above.
+- Exercise only an obviously fake known value in `tests/Test-ReceiptProtocol.ps1` and prove that the exact value appears nowhere in sanitized text, validation results, or dashboard-safe projections.
+
 ## Append-only correction
 
 - If a sensitive value is already present in an append-only bd/comment store and no supported edit exists, do not repeat the value in any follow-up.
