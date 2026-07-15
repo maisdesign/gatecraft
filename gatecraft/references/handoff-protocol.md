@@ -41,6 +41,8 @@ Check after each complete bead cycle and before claiming another; do not poll on
 
 ## The two tiers
 
+The two tiers below apply only when a trustworthy short-session value is available. They never apply to weekly usage: a weekly-only reading remains valid while the short-session capability is unavailable, and it must not trigger either tier.
+
 - **Below 95%, but with the next full bead cycle genuinely at risk:** judgment based on estimated bead size, not another fixed percentage. Check 0.6 candidates' headroom with the same introspection, write the snapshot even if none is confirmed, report current usage/reset and candidates with room, and ask whether to hand off or continue.
 - **At or above 95%:** treat this as an overwhelming margin, not a judgment call. Without waiting for a live answer, select the first 0.6 candidate with confirmed headroom, write the snapshot, and hand off. If 0.6 says stop, write the snapshot and stop.
 

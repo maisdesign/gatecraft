@@ -1,0 +1,499 @@
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$failures = [Collections.Generic.List[string]]::new()
+
+function Add-Failure {
+    param([Parameter(Mandatory)][string] $Message)
+    $script:failures.Add($Message)
+}
+
+function Assert-True {
+    param(
+        [Parameter(Mandatory)][bool] $Condition,
+        [Parameter(Mandatory)][string] $Message
+    )
+    if (-not $Condition) {
+        Add-Failure $Message
+    }
+}
+
+function Assert-Equal {
+    param(
+        [AllowNull()]
+        [object] $Actual,
+
+        [AllowNull()]
+        [object] $Expected,
+
+        [Parameter(Mandatory)]
+        [string] $Message
+    )
+    if ($null -eq $Expected) {
+        if ($null -ne $Actual) {
+            Add-Failure "$Message Expected null; found '$Actual'."
+        }
+        return
+    }
+    if ($null -eq $Actual -or $Actual -ne $Expected) {
+        Add-Failure "$Message Expected '$Expected'; found '$Actual'."
+    }
+}
+
+function Assert-Match {
+    param(
+        [Parameter(Mandatory)][string] $Text,
+        [Parameter(Mandatory)][string] $Pattern,
+        [Parameter(Mandatory)][string] $Message
+    )
+    if (-not [regex]::IsMatch($Text, $Pattern)) {
+        Add-Failure $Message
+    }
+}
+
+function Assert-NotMatch {
+    param(
+        [Parameter(Mandatory)][string] $Text,
+        [Parameter(Mandatory)][string] $Pattern,
+        [Parameter(Mandatory)][string] $Message
+    )
+    if ([regex]::IsMatch($Text, $Pattern)) {
+        Add-Failure $Message
+    }
+}
+
+function Read-RequiredText {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Label
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Add-Failure "$Label is missing at $Path."
+        return ''
+    }
+    return [IO.File]::ReadAllText($Path)
+}
+
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+$contractPath = Join-Path $repoRoot 'gatecraft/references/execution-contract.md'
+$hygienePath = Join-Path $repoRoot 'gatecraft/references/evidence-hygiene.md'
+$skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
+$dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
+$quotaPath = Join-Path $repoRoot 'gatecraft/references/codex-quota.md'
+$changelogPath = Join-Path $repoRoot 'gatecraft/references/changelog.md'
+$readmePath = Join-Path $repoRoot 'README.md'
+$gitignorePath = Join-Path $repoRoot '.gitignore'
+
+$contract = Read-RequiredText -Path $contractPath -Label 'Normative execution contract'
+$hygiene = Read-RequiredText -Path $hygienePath -Label 'Raw-log hygiene reference'
+$skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
+$dispatch = Read-RequiredText -Path $dispatchPath -Label 'Dispatch template'
+$quota = Read-RequiredText -Path $quotaPath -Label 'Quota adapter reference'
+$changelog = Read-RequiredText -Path $changelogPath -Label 'Changelog'
+$readme = Read-RequiredText -Path $readmePath -Label 'README'
+$gitignore = Read-RequiredText -Path $gitignorePath -Label '.gitignore'
+
+# Contract IDs, fields, ordering, modes, and imperative form.
+$expectedIds = [Collections.Generic.List[string]]::new()
+$expectedIds.Add('GC-0.0')
+foreach ($number in 1..12) {
+    $expectedIds.Add("GC-0.$number")
+}
+foreach ($number in 1..12) {
+    $expectedIds.Add("GC-1.$number")
+}
+
+$recordPattern = '(?ms)^### (?<id>GC-\d+\.\d+)\b[^\r\n]*\r?\n(?<body>.*?)(?=^### GC-|\z)'
+$records = [regex]::Matches($contract, $recordPattern)
+$actualIds = @($records | ForEach-Object { $_.Groups['id'].Value })
+
+Assert-True -Condition ($records.Count -eq $expectedIds.Count) -Message "Contract must contain exactly $($expectedIds.Count) GC records; found $($records.Count)."
+Assert-True -Condition (($actualIds -join '|') -ceq (@($expectedIds) -join '|')) -Message "Contract record IDs or order differ. Expected: $(@($expectedIds) -join ', '); found: $($actualIds -join ', ')."
+Assert-Match -Text $contract -Pattern '(?m)^### GC-0\.0\b.*\bBLOCKING\b' -Message 'GC-0.0 must be visibly marked BLOCKING.'
+
+$triggerVerbs = 'Begin|Continue|Complete|Prepare|Enter|Select|Launch|Verify|Evaluate|Record|Finish'
+$actionVerbs = 'Create|Check|Enumerate|Detect|Persist|Declare|Obtain|Designate|Compare|Select|Fill|Match|Set|Inspect|Pause|Apply|Lead|Append|Ask|Verify'
+foreach ($record in $records) {
+    $id = $record.Groups['id'].Value
+    $body = $record.Groups['body'].Value
+    foreach ($field in @('Trigger', 'Action', 'Evidence', 'Stop')) {
+        $fieldPattern = '(?m)^- \*\*' + [regex]::Escape($field) + ':\*\*[ \t]+(?<value>\S.*)$'
+        $fieldMatches = [regex]::Matches($body, $fieldPattern)
+        Assert-True -Condition ($fieldMatches.Count -eq 1) -Message "$id must contain exactly one non-empty $field field; found $($fieldMatches.Count)."
+        if ($fieldMatches.Count -eq 1) {
+            $value = $fieldMatches[0].Groups['value'].Value
+            switch ($field) {
+                'Trigger' {
+                    Assert-Match -Text $value -Pattern "^(?:$triggerVerbs)\b" -Message "$id Trigger must begin in imperative/infinitive form; found: $value"
+                }
+                'Action' {
+                    Assert-Match -Text $value -Pattern "^(?:$actionVerbs)\b" -Message "$id Action must begin in imperative/infinitive form; found: $value"
+                }
+                'Evidence' {
+                    Assert-Match -Text $value -Pattern '^Record\b' -Message "$id Evidence must begin with the imperative Record; found: $value"
+                }
+                'Stop' {
+                    Assert-Match -Text $value -Pattern '^Stop\b' -Message "$id Stop must begin with the imperative Stop; found: $value"
+                }
+            }
+        }
+    }
+}
+
+$modeSectionMatch = [regex]::Match($contract, '(?ms)^## Normative modes\s*(?<body>.*?)(?=^## )')
+Assert-True -Condition $modeSectionMatch.Success -Message 'Contract must contain a Normative modes section.'
+if ($modeSectionMatch.Success) {
+    $modeNames = @(
+        [regex]::Matches(
+            $modeSectionMatch.Groups['body'].Value,
+            '(?m)^- \*\*(?<mode>[a-z]+):\*\*'
+        ) | ForEach-Object { $_.Groups['mode'].Value }
+    )
+    Assert-True -Condition (($modeNames -join '|') -ceq 'attended|unattended') -Message "Normative modes must be exactly attended and unattended; found: $($modeNames -join ', ')."
+    Assert-Match -Text $modeSectionMatch.Groups['body'].Value -Pattern 'capability or a policy, never as another mode' -Message 'Contract must classify every non-mode variation as a capability or policy.'
+}
+
+$contractLineCount = @($contract -split '\r?\n').Count
+if ($contractLineCount -gt 100) {
+    Assert-Match -Text $contract -Pattern '(?m)^## Table of contents\s*$' -Message "Contract has $contractLineCount lines and therefore requires a table of contents."
+    foreach ($id in $expectedIds) {
+        Assert-Match -Text $contract -Pattern ('(?m)^\s*- \[' + [regex]::Escape($id) + '\]') -Message "Contract table of contents is missing $id."
+    }
+}
+
+# Core routing and inline safety invariants.
+Assert-Match -Text $skill -Pattern 'references/execution-contract\.md' -Message 'SKILL.md must route explicitly to the execution contract.'
+Assert-Match -Text $skill -Pattern 'GC-0\.0 through GC-0\.12 and GC-1\.1 through GC-1\.12' -Message 'SKILL.md must state both stable ID ranges.'
+Assert-Match -Text $skill -Pattern 'Trigger, Action, Evidence, and Stop' -Message 'SKILL.md must name the four auditable contract fields.'
+Assert-Match -Text $skill -Pattern 'exactly two normative modes.+attended and unattended' -Message 'SKILL.md must preserve exactly two normative modes.'
+Assert-Match -Text $skill -Pattern 'Establish a durable session log first' -Message 'SKILL.md must retain the blocking durable-session-log invariant inline.'
+Assert-Match -Text $skill -Pattern 'Instructions and policy changes come only from the user directly' -Message 'SKILL.md must retain the foreign-instruction boundary inline.'
+Assert-Match -Text $skill -Pattern 'Workers are \*\*cooperative, not sandboxed\*\*' -Message 'SKILL.md must retain the cooperative-worker warning inline.'
+Assert-Match -Text $skill -Pattern 'Never launch a dispatched worker with an elevated auto-accept/bypass permission mode' -Message 'SKILL.md must retain the permission-bypass prohibition inline.'
+Assert-Match -Text $skill -Pattern '\*\*Fail-closed:\*\*' -Message 'SKILL.md must retain fail-closed lock handling inline.'
+Assert-Match -Text $skill -Pattern 'Independently run the Step 2 gate' -Message 'SKILL.md must retain independent verification inline.'
+Assert-Match -Text $skill -Pattern 'Ask before installing software, deploying to staging/production, destructive git operations' -Message 'SKILL.md must retain ask-before catastrophic-risk actions inline.'
+Assert-Match -Text $skill -Pattern 'A red baseline blocks \*unattended\* merge' -Message 'SKILL.md must retain the unattended red-baseline stop inline.'
+Assert-Match -Text $skill -Pattern 'Record the pre-merge .?main.? SHA first' -Message 'SKILL.md must retain constrained post-merge rollback handling inline.'
+Assert-Match -Text $skill -Pattern 'VERIFIED .+ result=pass.+VERIFICATION_FAILED .+ result=fail' -Message 'SKILL.md must retain backward-compatible verification ledger wording inline.'
+Assert-Match -Text $skill -Pattern 'allow only sanitized evidence to become durable/shared/public' -Message 'SKILL.md must retain the raw-evidence publication boundary inline.'
+
+# Absolute worktree template with both platform rules.
+Assert-Match -Text $dispatch -Pattern '(?m)^Worktree: <absolute-worktree-path> on branch work/<id>-a<n>' -Message 'Dispatch template Worktree field must use <absolute-worktree-path>.'
+Assert-Match -Text $dispatch -Pattern '(?m)^Worktree platform rule \(bootstrap-filled from GC-0\.3\):' -Message 'Dispatch template must include a bootstrap-filled platform rule.'
+Assert-Match -Text $dispatch -Pattern 'Codex/Windows example: C:\\Users\\<user>\\codex-worktrees\\<repo>-<id>-a<n> \(under the user''s home\)' -Message "Dispatch template must show a Codex/Windows absolute worktree under the user's home."
+Assert-Match -Text $dispatch -Pattern 'Unix example for /home/<user>/src/<repo>: /home/<user>/src/<repo>-wt-<id>-a<n> \(sibling of the repo\)' -Message 'Dispatch template must show an absolute Unix sibling worktree.'
+Assert-NotMatch -Text $dispatch -Pattern '(?m)^Worktree: \.\./repo-wt-' -Message 'Dispatch template must not retain the relative worktree field.'
+
+# PowerShell quota adapters, hard timeouts, at-most-once behavior, and no-data.
+Assert-Match -Text $quota -Pattern 'function Get-ClaudeQuotaSnapshot' -Message 'Quota reference must include a copyable Claude PowerShell adapter.'
+Assert-Match -Text $quota -Pattern 'function Get-CodexQuotaSnapshot' -Message 'Quota reference must include a copyable Codex PowerShell adapter.'
+Assert-Match -Text $quota -Pattern 'function ConvertTo-GatecraftCodexQuotaSnapshot' -Message 'Quota reference must include a pure Codex window normalizer.'
+Assert-Match -Text $quota -Pattern 'require PowerShell 7 or later and must be run with `pwsh`' -Message 'Quota reference must declare the PowerShell 7+ runtime requirement.'
+Assert-True -Condition (([regex]::Matches($quota, "reason\s*=\s*'powershell-version-unsupported'")).Count -ge 2) -Message 'Both adapters must distinguish unsupported PowerShell from provider no-data.'
+Assert-Match -Text $quota -Pattern 'Get-Command \$Command -CommandType Application, ExternalScript' -Message 'CLI resolution must exclude aliases and functions.'
+Assert-Match -Text $quota -Pattern 'function New-GatecraftCmdPayload' -Message 'Quota helper must define a testable cmd/bat payload builder.'
+Assert-Match -Text $quota -Pattern '\$psi\.Arguments = ''/d /s /c ''' -Message 'cmd/bat shims must use one raw pre-quoted ComSpec payload rather than ArgumentList re-quoting.'
+Assert-Match -Text $quota -Pattern 'official-experimental Codex app-server' -Message 'Quota reference must identify the Codex adapter as official-experimental.'
+Assert-Match -Text $quota -Pattern 'account/rateLimits/read' -Message 'Quota reference must call the structured Codex rate-limit method.'
+Assert-Match -Text $quota -Pattern 'at most once after a complete bead cycle' -Message 'Quota guidance must limit adapters to at most once per cycle.'
+Assert-Match -Text $quota -Pattern 'Never poll, tightly repeat, or retry an adapter in the same cycle' -Message 'Quota guidance must prohibit same-cycle retries.'
+Assert-Match -Text $quota -Pattern 'hard timeout of at least 15 seconds' -Message 'Quota guidance must require a hard timeout.'
+Assert-True -Condition (([regex]::Matches($quota, '\[ValidateRange\(15, 300\)\]')).Count -ge 2) -Message 'Both PowerShell adapters must enforce a timeout of at least 15 seconds.'
+Assert-Match -Text $quota -Pattern '\.WaitForExit\(\$TimeoutSeconds \* 1000\)' -Message 'Claude adapter must implement its hard timeout.'
+Assert-Match -Text $quota -Pattern 'AddSeconds\(\$TimeoutSeconds\)' -Message 'Codex adapter must implement a total hard deadline.'
+Assert-Match -Text $quota -Pattern '\.Kill\(\$true\)' -Message 'Quota adapters must reap the process tree on timeout or completion.'
+Assert-Match -Text $quota -Pattern "status\s*=\s*'no-data'" -Message 'Quota adapters must return an explicit no-data status.'
+Assert-Match -Text $quota -Pattern 'usedPercent\s*=\s*\$null' -Message 'Quota adapters must represent missing percentages as null.'
+Assert-Match -Text $quota -Pattern 'Never convert a missing or transient response into 0%' -Message 'Quota guidance must explicitly forbid converting missing/transient data to zero.'
+Assert-Match -Text $quota -Pattern 'Do not retry in that cycle and do not synthesize a zero' -Message 'Codex transient responses must remain no-data for the cycle.'
+
+$powerShellBlocks = [regex]::Matches($quota, '(?ms)^~~~powershell\r?\n(?<code>.*?)^~~~\s*$')
+Assert-True -Condition ($powerShellBlocks.Count -ge 3) -Message "Quota reference must contain copyable PowerShell helper, Claude, and Codex blocks; found $($powerShellBlocks.Count)."
+foreach ($block in $powerShellBlocks) {
+    $tokens = $null
+    $parseErrors = $null
+    [void] [Management.Automation.Language.Parser]::ParseInput(
+        $block.Groups['code'].Value,
+        [ref] $tokens,
+        [ref] $parseErrors
+    )
+    foreach ($parseError in @($parseErrors)) {
+        Add-Failure "PowerShell quota example has a syntax error at '$($parseError.Extent.Text)': $($parseError.Message)"
+    }
+}
+
+# Load only documented pure function bodies; never execute either live adapter.
+function Get-DocumentedFunctionScriptBlock {
+    param(
+        [Parameter(Mandatory)]
+        [Text.RegularExpressions.Match] $Block,
+
+        [Parameter(Mandatory)]
+        [string] $Name
+    )
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Block.Groups['code'].Value,
+        [ref] $tokens,
+        [ref] $parseErrors
+    )
+    $functionAst = $ast.Find(
+        {
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $Name
+        },
+        $true
+    )
+    Assert-True -Condition ($null -ne $functionAst) -Message "Could not extract $Name from its documented block."
+    if ($null -eq $functionAst) {
+        return $null
+    }
+    $body = $functionAst.Body.Extent.Text
+    return [scriptblock]::Create($body.Substring(1, $body.Length - 2))
+}
+
+$helperBlock = @(
+    $powerShellBlocks | Where-Object {
+        $_.Groups['code'].Value -match 'function New-GatecraftCmdPayload'
+    }
+) | Select-Object -First 1
+$claudeBlock = @(
+    $powerShellBlocks | Where-Object {
+        $_.Groups['code'].Value -match 'function ConvertFrom-GatecraftClaudeUsageText'
+    }
+) | Select-Object -First 1
+$codexBlock = @(
+    $powerShellBlocks | Where-Object {
+        $_.Groups['code'].Value -match 'function ConvertTo-GatecraftCodexQuotaSnapshot'
+    }
+) | Select-Object -First 1
+Assert-True -Condition ($null -ne $helperBlock) -Message 'Could not find the documented process-helper block for fixture tests.'
+Assert-True -Condition ($null -ne $claudeBlock) -Message 'Could not find the documented Claude parser block for fixture tests.'
+Assert-True -Condition ($null -ne $codexBlock) -Message 'Could not find the documented Codex normalizer block for fixture tests.'
+
+$buildCmdPayload = if ($null -ne $helperBlock) {
+    Get-DocumentedFunctionScriptBlock -Block $helperBlock -Name 'New-GatecraftCmdPayload'
+}
+$parseClaudeUsage = if ($null -ne $claudeBlock) {
+    Get-DocumentedFunctionScriptBlock -Block $claudeBlock -Name 'ConvertFrom-GatecraftClaudeUsageText'
+}
+$normalizeCodexQuota = $null
+if ($null -ne $codexBlock) {
+    $normalizeCodexQuota = Get-DocumentedFunctionScriptBlock -Block $codexBlock -Name 'ConvertTo-GatecraftCodexQuotaSnapshot'
+}
+
+if ($null -ne $buildCmdPayload) {
+    $payload = & $buildCmdPayload -FilePath 'C:\Program Files\tool.cmd' -ArgumentList @('alpha', 'two words')
+    Assert-Equal $payload '""C:\Program Files\tool.cmd" "alpha" "two words""' 'cmd/bat payload must preserve paths and arguments containing spaces.'
+    $metacharacterRejected = $false
+    try {
+        [void] (& $buildCmdPayload -FilePath 'C:\tool.cmd' -ArgumentList @('unsafe&value'))
+    }
+    catch {
+        $metacharacterRejected = $true
+    }
+    Assert-True -Condition $metacharacterRejected -Message 'cmd/bat payload builder must reject shell metacharacters.'
+}
+
+if ($null -ne $parseClaudeUsage) {
+    $claudeNormal = & $parseClaudeUsage -Text "Current session: 42.5% used · resets 3pm"
+    Assert-Equal $claudeNormal.status 'ok' 'Claude parser positive fixture status.'
+    Assert-Equal $claudeNormal.usedPercent 42.5 'Claude parser positive fixture percentage.'
+
+    $claudeMisleading = & $parseClaudeUsage -Text "Current week: 99% used`nA sentence mentions Current session: 12% used inline."
+    Assert-Equal $claudeMisleading.status 'no-data' 'Claude parser must reject weekly or inline prose lookalikes.'
+    Assert-Equal $claudeMisleading.usedPercent $null 'Claude misleading fixture must remain null.'
+}
+
+if ($null -ne $normalizeCodexQuota) {
+    $normal = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 23; windowDurationMins = 300; resetsAt = 1750000300 }
+        secondary = [pscustomobject]@{ usedPercent = 61; windowDurationMins = 10080; resetsAt = 1750604800 }
+        planType = 'plus'
+    })
+    Assert-Equal $normal.status 'ok' 'Normal payload status.'
+    Assert-Equal $normal.sessionAvailable $true 'Normal payload session availability.'
+    Assert-Equal $normal.weeklyAvailable $true 'Normal payload weekly availability.'
+    Assert-Equal $normal.sessionUsedPercent 23 'Normal payload session percentage.'
+    Assert-Equal $normal.weeklyUsedPercent 61 'Normal payload weekly percentage.'
+    Assert-Equal $normal.usedPercent 23 'Normal payload backward-compatible percentage.'
+    Assert-Equal $normal.primaryWindowDurationMins 300 'Normal payload raw primary duration.'
+    Assert-Equal $normal.secondaryResetsAt 1750604800 'Normal payload raw secondary reset.'
+
+    $weeklyOnly = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 64; windowDurationMins = 10080; resetsAt = 1750604800 }
+        planType = 'plus'
+    })
+    Assert-Equal $weeklyOnly.status 'ok' 'Weekly-only payload status.'
+    Assert-Equal $weeklyOnly.sessionAvailable $false 'Weekly-only session availability.'
+    Assert-Equal $weeklyOnly.weeklyAvailable $true 'Weekly-only weekly availability.'
+    Assert-Equal $weeklyOnly.sessionUsedPercent $null 'Weekly-only session percentage.'
+    Assert-Equal $weeklyOnly.weeklyUsedPercent 64 'Weekly-only weekly percentage.'
+    Assert-Equal $weeklyOnly.usedPercent $null 'Weekly-only backward-compatible percentage.'
+    Assert-Equal $weeklyOnly.primaryUsedPercent 64 'Weekly-only raw primary percentage.'
+
+    $reversed = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 72; windowDurationMins = 10080; resetsAt = 1750604800 }
+        secondary = [pscustomobject]@{ usedPercent = 87; windowDurationMins = 300; resetsAt = 1750000300 }
+    })
+    Assert-Equal $reversed.status 'ok' 'Reversed payload status.'
+    Assert-Equal $reversed.sessionUsedPercent 87 'Reversed payload session percentage.'
+    Assert-Equal $reversed.weeklyUsedPercent 72 'Reversed payload weekly percentage.'
+    Assert-Equal $reversed.usedPercent 87 'Reversed payload backward-compatible percentage.'
+    Assert-Equal $reversed.primaryWindowDurationMins 10080 'Reversed payload raw primary duration.'
+    Assert-Equal $reversed.secondaryWindowDurationMins 300 'Reversed payload raw secondary duration.'
+
+    $noWindows = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{ planType = 'plus' })
+    Assert-Equal $noWindows.status 'no-data' 'No-window payload status.'
+    Assert-Equal $noWindows.sessionAvailable $false 'No-window session availability.'
+    Assert-Equal $noWindows.weeklyAvailable $false 'No-window weekly availability.'
+    Assert-Equal $noWindows.sessionUsedPercent $null 'No-window session percentage.'
+    Assert-Equal $noWindows.weeklyUsedPercent $null 'No-window weekly percentage.'
+    Assert-Equal $noWindows.usedPercent $null 'No-window backward-compatible percentage.'
+
+    $unrecognized = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 95; windowDurationMins = 1440; resetsAt = 1750000300 }
+    })
+    Assert-Equal $unrecognized.status 'no-data' 'Unrecognized-duration payload status.'
+    Assert-Equal $unrecognized.sessionAvailable $false 'Unrecognized-duration session availability.'
+    Assert-Equal $unrecognized.weeklyAvailable $false 'Unrecognized-duration weekly availability.'
+    Assert-Equal $unrecognized.usedPercent $null 'Unrecognized-duration backward-compatible percentage.'
+    Assert-Equal $unrecognized.primaryUsedPercent 95 'Unrecognized-duration raw primary percentage.'
+    Assert-Equal $unrecognized.primaryWindowDurationMins 1440 'Unrecognized-duration raw primary duration.'
+
+    $outOfRangeSession = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 101; windowDurationMins = 300; resetsAt = 1750000300 }
+        secondary = [pscustomobject]@{ usedPercent = 79; windowDurationMins = 10080; resetsAt = 1750604800 }
+    })
+    Assert-Equal $outOfRangeSession.status 'ok' 'Out-of-range session with valid weekly payload status.'
+    Assert-Equal $outOfRangeSession.sessionAvailable $false 'Out-of-range session availability.'
+    Assert-Equal $outOfRangeSession.weeklyUsedPercent 79 'Out-of-range session weekly percentage.'
+    Assert-Equal $outOfRangeSession.usedPercent $null 'Out-of-range session must not drive the handoff percentage.'
+
+    $malformedSession = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = '42'; windowDurationMins = 300; resetsAt = 1750000300 }
+    })
+    Assert-Equal $malformedSession.status 'no-data' 'Malformed session payload status.'
+    Assert-Equal $malformedSession.sessionAvailable $false 'Malformed session availability.'
+    Assert-Equal $malformedSession.sessionUsedPercent $null 'Malformed session percentage.'
+    Assert-Equal $malformedSession.usedPercent $null 'Malformed session must not drive the handoff percentage.'
+    Assert-Equal $malformedSession.primaryUsedPercent '42' 'Malformed session raw primary percentage.'
+
+    $duplicateSession = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+        primary = [pscustomobject]@{ usedPercent = 41; windowDurationMins = 300; resetsAt = 1750000300 }
+        secondary = [pscustomobject]@{ usedPercent = 42; windowDurationMins = 300; resetsAt = 1750000400 }
+    })
+    Assert-Equal $duplicateSession.status 'no-data' 'Duplicate-session payload status.'
+    Assert-Equal $duplicateSession.sessionAvailable $false 'Duplicate-session payload must be ambiguous and unavailable.'
+    Assert-Equal $duplicateSession.usedPercent $null 'Duplicate-session payload must not drive handoff.'
+
+    foreach ($invalidReset in @(
+        [pscustomobject]@{ Label = 'Missing reset'; Value = $null; Include = $false },
+        [pscustomobject]@{ Label = 'Fractional reset'; Value = 1750000300.5; Include = $true },
+        [pscustomobject]@{ Label = 'Negative reset'; Value = -1; Include = $true }
+    )) {
+        $window = [ordered]@{ usedPercent = 43; windowDurationMins = 300 }
+        if ($invalidReset.Include) {
+            $window.resetsAt = $invalidReset.Value
+        }
+        $snapshot = & $normalizeCodexQuota -RateLimits ([pscustomobject]@{
+            primary = [pscustomobject] $window
+        })
+        Assert-Equal $snapshot.status 'no-data' "$($invalidReset.Label) payload status."
+        Assert-Equal $snapshot.sessionAvailable $false "$($invalidReset.Label) session availability."
+        Assert-Equal $snapshot.usedPercent $null "$($invalidReset.Label) must not drive handoff."
+    }
+}
+
+# Monotonic changelog and preserved historical anchors.
+$dateMatches = [regex]::Matches($changelog, '(?m)^- \*\*(?<date>2026-\d{2}-\d{2})[^\r\n]*\*\*:')
+Assert-True -Condition ($dateMatches.Count -ge 1) -Message 'Changelog must contain dated section headings.'
+$previousDate = $null
+foreach ($dateMatch in $dateMatches) {
+    $dateText = $dateMatch.Groups['date'].Value
+    $dateValue = [datetime]::ParseExact(
+        $dateText,
+        'yyyy-MM-dd',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+    if ($null -ne $previousDate -and $dateValue -lt $previousDate) {
+        Add-Failure "Changelog dates are not monotonic ascending at $dateText after $($previousDate.ToString('yyyy-MM-dd'))."
+    }
+    $previousDate = $dateValue
+}
+$position13 = $changelog.IndexOf('- **2026-07-13**:')
+$position14 = $changelog.IndexOf('- **2026-07-14**:')
+$position15 = $changelog.IndexOf('- **2026-07-15**:')
+Assert-True -Condition ($position13 -ge 0 -and $position13 -lt $position14) -Message 'The 2026-07-13 section must precede every 2026-07-14 section.'
+Assert-True -Condition ($position14 -ge 0 -and $position14 -lt $position15) -Message 'The 2026-07-15 section must follow all 2026-07-14 sections.'
+Assert-Match -Text $changelog -Pattern 'Harvest from Menu-Nomade session 7''s log' -Message 'Historical 2026-07-15 wording anchor is missing.'
+Assert-Match -Text $changelog -Pattern 'Five findings folded in from two orchestration sessions on OrizzonteDiploma' -Message 'Historical 2026-07-14 wording anchor is missing.'
+Assert-Match -Text $changelog -Pattern 'Renamed .+ to Gatecraft, published under a fresh public repository' -Message 'Historical 2026-07-13 wording anchor is missing.'
+Assert-Match -Text $changelog -Pattern 'Contract-first foundation and five approved tweaks' -Message 'The substantive contract-first change must be appended to 2026-07-15.'
+
+# Raw-log ignore boundary and documentation.
+foreach ($pattern in @('log/', '/logs/', '/.llm/runtime/', '/.gatecraft/', '*.attempt-*.log', '*.raw-session.*')) {
+    $escaped = [regex]::Escape($pattern)
+    Assert-Match -Text $gitignore -Pattern ("(?m)^$escaped\s*$") -Message ".gitignore is missing Gatecraft raw/runtime pattern: $pattern"
+}
+Assert-Match -Text $hygiene -Pattern 'Restrict access to the current user and explicitly authorized local operators' -Message 'Evidence hygiene must require restrictive local access.'
+Assert-Match -Text $hygiene -Pattern 'Redact credentials, tokens, cookies, authorization headers' -Message 'Evidence hygiene must require redaction.'
+Assert-Match -Text $hygiene -Pattern 'before writing it to bd, refreshing a dashboard/export, committing it, or publishing it' -Message 'Evidence hygiene must enforce redaction at bd/dashboard/publication boundaries.'
+Assert-Match -Text $hygiene -Pattern 'Default the retention expiry for raw session and attempt logs to 30 days' -Message 'Evidence hygiene must define a retention default without granting deletion authority.'
+Assert-Match -Text $hygiene -Pattern 'ask the user before disabling inheritance or narrowing access' -Message 'Evidence hygiene must make ACL remediation ask-before.'
+Assert-Match -Text $hygiene -Pattern 'never add principals as a remediation' -Message 'Evidence hygiene must forbid broadening ACLs as remediation.'
+Assert-Match -Text $hygiene -Pattern 'Retention expiry is not deletion authority' -Message 'Evidence expiry must not silently authorize deletion.'
+Assert-Match -Text $hygiene -Pattern 'Do not perform direct database surgery' -Message 'Append-only correction must forbid unsupported database surgery.'
+Assert-Match -Text $hygiene -Pattern 'sanitized projection can exclude it or replace it with the typed-marker correction' -Message 'Tainted durable evidence must block unsanitized projection.'
+Assert-Match -Text $hygiene -Pattern 'Allow only sanitized evidence across the durable/shared/public boundary' -Message 'Evidence hygiene must allow only sanitized durable/shared/public evidence.'
+Assert-Match -Text $hygiene -Pattern 'Never publish or commit a raw session log, attempt log, native transcript, local runtime state' -Message 'Evidence hygiene must forbid durable/public raw logs and runtime state.'
+Assert-Match -Text $contract -Pattern 'user-approved project \.gitignore rule.+local \.git/info/exclude.+outside the repository' -Message 'GC-0.0 must define a non-silent target-repository ignore mechanism.'
+Assert-Match -Text $skill -Pattern 'without silently editing the user''s tracked `\.gitignore`' -Message 'SKILL.md must retain the target-repository ignore boundary inline.'
+Assert-Match -Text (Read-RequiredText -Path (Join-Path $repoRoot 'gatecraft/references/handoff-protocol.md') -Label 'Handoff protocol') -Pattern 'tiers below apply only when a trustworthy short-session value is available' -Message 'Handoff tiers must never use weekly-only usage.'
+
+# README truth in both languages and repository layout.
+$englishMatch = [regex]::Match($readme, '(?s)### Orchestrator seat compatibility(?<body>.*?)(?=### Repository layout)')
+$italianMatch = [regex]::Match($readme, '(?s)### Compatibilità della sedia dell''orchestratore(?<body>.*?)(?=### Struttura del repository)')
+Assert-True -Condition $englishMatch.Success -Message 'README English orchestrator compatibility section is missing.'
+Assert-True -Condition $italianMatch.Success -Message 'README Italian orchestrator compatibility section is missing.'
+if ($englishMatch.Success) {
+    $english = $englishMatch.Groups['body'].Value
+    Assert-Match -Text $english -Pattern 'Claude Code is the most field-tested orchestrator seat, not a categorical requirement' -Message 'README English must state the narrower Claude field-tested truth.'
+    Assert-Match -Text $english -Pattern 'Codex also has a verified official-experimental structured quota adapter' -Message 'README English must state the verified Codex structured adapter.'
+    foreach ($capability in @('self-identification', 'usage introspection', 'non-interactive launch', 'ACK/lock acquisition', 'process-tree reap')) {
+        Assert-Match -Text $english -Pattern ([regex]::Escape($capability)) -Message "README English is missing orchestrator smoke-test capability: $capability"
+    }
+}
+if ($italianMatch.Success) {
+    $italian = $italianMatch.Groups['body'].Value
+    Assert-Match -Text $italian -Pattern 'Claude Code è la sedia di orchestrazione più collaudata sul campo, non un requisito categorico' -Message 'README Italian must state the narrower Claude field-tested truth.'
+    Assert-Match -Text $italian -Pattern 'Codex dispone di un adapter strutturato verificato e ufficiale-sperimentale' -Message 'README Italian must state the verified Codex structured adapter.'
+    foreach ($capability in @('auto-identificazione', 'lettura dell''uso', 'avvio non interattivo', 'ACK/acquisizione del lock', 'reap dell''albero dei processi')) {
+        Assert-Match -Text $italian -Pattern ([regex]::Escape($capability)) -Message "README Italian is missing orchestrator smoke-test capability: $capability"
+    }
+}
+Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
+Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
+foreach ($newFile in @('execution-contract.md', 'evidence-hygiene.md', 'Test-ProtocolContract.ps1')) {
+    $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
+    Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
+}
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract\.ps1')).Count -ge 2) -Message 'README must give the exact maintainer gate command in both languages.'
+
+if ($failures.Count -gt 0) {
+    [Console]::Error.WriteLine("Protocol contract gate failed with $($failures.Count) issue(s):")
+    foreach ($failure in $failures) {
+        [Console]::Error.WriteLine(" - $failure")
+    }
+    exit 1
+}
+
+Write-Host "Protocol contract gate passed: $($records.Count) records, exactly two modes, all requested acceptance checks green."
+exit 0

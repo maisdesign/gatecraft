@@ -43,27 +43,31 @@ Hand a backlog to a swarm of agents and the failure mode is always the same: som
 | 🤝 **Handoff as temporary regency** | On rate-limit exhaustion the orchestrator role is handed off with a durable snapshot and reclaimed later — with a best-effort lock, heartbeat/staleness rules, and ACK windows to avoid two orchestrators acting at once. |
 | 🌙 **Safe unattended operation** | Silence is never authorization. Standing policies decided at bootstrap (succession, worker-exhaustion, unattended ceiling, push/deploy) resolve only what the user explicitly delegated. |
 
-### Why Claude Code drives the orchestrator seat
+### Orchestrator seat compatibility
 
-This is a deliberate design decision, not an oversight: **the orchestrator role is Claude Code–specific, while worker roles are vendor-neutral.** You can dispatch beads to codex, Gemini/AntiGravity, or any capable CLI agent as *workers* — but the agent holding the orchestrator seat should be Claude Code.
+Claude Code is the most field-tested orchestrator seat, not a categorical requirement. Codex also has a verified official-experimental structured quota adapter through codex app-server --stdio and account/rateLimits/read; its path is cleaner than a TUI scrape but has less field history. Worker roles remain vendor-neutral.
 
-The reason is concrete and lives in [`references/codex-quota.md`](gatecraft/references/codex-quota.md): the orchestrator's autonomous rate-limit handoff (Step 3) depends on reading its own usage non-interactively. Claude Code's `/usage` is a best-effort but working channel; codex's cleanest equivalent turned out to be its *official experimental* `codex app-server --stdio` JSON-RPC interface (`account/rateLimits/read`) — cleaner than expected, but still a different, less battle-tested path than `/usage`. The same seat also leans on Claude Code mechanisms for self-identification (`CLAUDE_CONFIG_DIR`) and skill auto-loading.
+Require every orchestrator candidate, regardless of vendor, to pass bootstrap smoke tests for self-identification, usage introspection, non-interactive launch, ACK/lock acquisition, and process-tree reap. Treat skill auto-loading and profile discovery as capabilities to supply through the candidate's own environment; reject automatic succession for a seat that fails any required smoke test. See [references/codex-quota.md](gatecraft/references/codex-quota.md) for the Claude and Codex adapters.
 
 ### Repository layout
 
-```text
+~~~text
 gatecraft/                       # the installable unit — copy this whole folder
-├─ SKILL.md                      # the core protocol (Steps 0–4)
-└─ references/
-   ├─ dispatch-template.md       # the fill-every-field worker prompt
-   ├─ anti-patterns.md           # lived failures → the rules that prevent them
-   ├─ changelog.md               # dated record of every substantive revision
-   ├─ handoff-protocol.md        # Step 3 mechanics: lock, watchdogs, verification ledger
-   ├─ codex-quota.md             # non-interactive usage-channel investigation (both vendors)
-   ├─ dashboard.md               # recommended dashboard tool + multi-source incident detail
-   └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
+├─ SKILL.md                      # core protocol, inline safety invariants, contract routing
+├─ references/
+│  ├─ execution-contract.md      # normative GC-0.0…GC-1.12 records
+│  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
+│  ├─ dispatch-template.md       # the fill-every-field worker prompt
+│  ├─ anti-patterns.md           # lived failures → the rules that prevent them
+│  ├─ changelog.md               # dated record of every substantive revision
+│  ├─ handoff-protocol.md        # Step 3 mechanics: lock, watchdogs, verification ledger
+│  ├─ codex-quota.md             # copyable PowerShell usage adapters
+│  ├─ dashboard.md               # recommended dashboard tool + incident detail
+│  └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
+└─ tests/
+   └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
-```
+~~~
 
 ### Install (short version)
 
@@ -87,6 +91,14 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 - a real shell (Claude Code CLI or its VS Code extension, or an equivalent shell-capable environment)
 
 `bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything.
+
+### Maintenance
+
+Before committing any change to the skill or its references, maintainers must run the protocol contract gate from the repository root:
+
+```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+```
 
 ### License
 
@@ -121,27 +133,31 @@ Se affidi un backlog a uno sciame di agenti, il modo di fallire è sempre lo ste
 | 🤝 **Handoff come reggenza temporanea** | All'esaurimento del rate-limit il ruolo di orchestratore passa con uno snapshot durevole e viene riottenuto dopo — con lock best-effort, regole di heartbeat/staleness e finestre di ACK per evitare due orchestratori attivi insieme. |
 | 🌙 **Operatività unattended sicura** | Il silenzio non è mai autorizzazione. Le policy decise al bootstrap (successione, esaurimento worker, tetto unattended, push/deploy) risolvono solo ciò che l'utente ha esplicitamente delegato. |
 
-### Perché è Claude Code a occupare la sedia dell'orchestratore
+### Compatibilità della sedia dell'orchestratore
 
-È una scelta di design deliberata, non una svista: **il ruolo di orchestratore è specifico di Claude Code, mentre i ruoli di worker sono neutri rispetto al vendor.** Puoi dispatchare bead a codex, Gemini/AntiGravity o qualunque CLI agent capace come *worker* — ma l'agente che occupa la sedia dell'orchestratore dovrebbe essere Claude Code.
+Claude Code è la sedia di orchestrazione più collaudata sul campo, non un requisito categorico. Anche Codex dispone di un adapter strutturato verificato e ufficiale-sperimentale tramite codex app-server --stdio e account/rateLimits/read; il canale è più pulito di uno scrape della TUI, ma ha meno esperienza sul campo. I ruoli worker restano neutrali rispetto al vendor.
 
-Il motivo è concreto ed è documentato in [`references/codex-quota.md`](gatecraft/references/codex-quota.md): l'handoff autonomo da rate-limit dell'orchestratore (Step 3) dipende dal leggere il proprio consumo in modo non-interattivo. Il `/usage` di Claude Code è un canale best-effort ma funzionante; l'equivalente più pulito su codex si è rivelato essere la sua interfaccia *ufficiale sperimentale* `codex app-server --stdio` via JSON-RPC (`account/rateLimits/read`) — più pulita del previsto, ma comunque un percorso diverso e meno collaudato di `/usage`. La stessa sedia si appoggia inoltre a meccanismi di Claude Code per l'auto-identificazione (`CLAUDE_CONFIG_DIR`) e l'auto-caricamento delle skill.
+Richiedi a ogni candidato orchestratore, indipendentemente dal vendor, di superare gli smoke test di bootstrap per auto-identificazione, lettura dell'uso, avvio non interattivo, ACK/acquisizione del lock e reap dell'albero dei processi. Tratta auto-caricamento della skill e discovery del profilo come capacità da fornire tramite l'ambiente del candidato; escludi dalla successione automatica una sedia che fallisce un test obbligatorio. Vedi [references/codex-quota.md](gatecraft/references/codex-quota.md) per gli adapter Claude e Codex.
 
 ### Struttura del repository
 
-```text
+~~~text
 gatecraft/                       # l'unità installabile — copia l'intera cartella
-├─ SKILL.md                      # il protocollo core (Step 0–4)
-└─ references/
-   ├─ dispatch-template.md       # il prompt worker con ogni campo da compilare
-   ├─ anti-patterns.md           # fallimenti vissuti → le regole che li prevengono
-   ├─ changelog.md               # registro datato di ogni revisione sostanziale
-   ├─ handoff-protocol.md        # meccanica dello Step 3: lock, watchdog, ledger di verifica
-   ├─ codex-quota.md             # indagine sui canali di uso non-interattivo (entrambi i vendor)
-   ├─ dashboard.md               # tool dashboard consigliato + dettaglio incidente multi-sorgente
-   └─ wordpress.md               # checklist ambiente WordPress + incidente sandbox Windows
+├─ SKILL.md                      # protocollo core, invarianti inline, routing al contratto
+├─ references/
+│  ├─ execution-contract.md      # record normativi GC-0.0…GC-1.12
+│  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
+│  ├─ dispatch-template.md       # prompt worker con ogni campo da compilare
+│  ├─ anti-patterns.md           # fallimenti vissuti → regole preventive
+│  ├─ changelog.md               # registro datato delle revisioni sostanziali
+│  ├─ handoff-protocol.md        # Step 3: lock, watchdog e ledger di verifica
+│  ├─ codex-quota.md             # adapter PowerShell copiabili per l'uso
+│  ├─ dashboard.md               # dashboard consigliata + dettaglio incidenti
+│  └─ wordpress.md               # checklist WordPress + incidente sandbox Windows
+└─ tests/
+   └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
-```
+~~~
 
 ### Installazione (versione breve)
 
@@ -165,6 +181,14 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 - una shell reale (Claude Code CLI o la sua estensione VS Code, o un ambiente equivalente con shell)
 
 `bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa.
+
+### Manutenzione
+
+Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire il gate del contratto del protocollo dalla root del repository:
+
+```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+```
 
 ### Licenza
 
