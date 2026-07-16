@@ -1,6 +1,6 @@
 # Verification v2, review receipts, and retry classes
 
-Use this reference when you emit or validate receipts, bind reviewed content, classify a failed spawn, or publish receipt-derived evidence. Keep the hot fail-closed rules in `SKILL.md`; apply the exact mechanics here without weakening any stricter execution-contract invariant.
+Use this reference when you emit or validate receipts, bind reviewed content, classify a failed spawn, or publish receipt-derived evidence. Keep the hot fail-closed rules in `SKILL.md`; apply the exact mechanics here without weakening any stricter execution-contract invariant. External-merge audit observations use the domain-separated, permanently non-qualifying rules in `recovery-protocol.md`.
 
 ## Table of contents
 
@@ -45,6 +45,9 @@ Emit one receipt per physical line. Start at column one with one of these exact 
 | `REVIEW_INCONCLUSIVE` | Record a review that cannot decide; never unblock with it. |
 | `REVIEW_CLARIFY` | Record the one permitted response to a block for the original review identity. |
 | `VERIFIED` | Record the final postmerge pass and preserve legacy consumers. |
+| `RECOVERY` | Parse a subject-bound `gatecraft-recovery/v1` attended audit observation; never count it as a verification receipt. |
+
+`RECOVERY` is recognized so malformed recovery text can fail closed, not so it can join this chain. Its exact external merge OID and bead/drift `subject_id` remain audit identifiers only. `Test-GatecraftVerificationChain` always adds `verification.recovery-nonqualifying` for that prefix, regardless of its position or artifact SHA. Validate a standalone audit observation with `Test-GatecraftRecoveryRecord`, use `ConvertTo-GatecraftRecoveryProjection` for durable-safe output, and apply `recovery-protocol.md`.
 
 Separate the prefix and each field with one or more ASCII spaces. Write every field as `lowercase_name=value`. Treat every field as a singleton. Reject trailing whitespace, tabs, physical newlines, duplicate fields, unknown fields, and missing required fields.
 
@@ -64,12 +67,14 @@ Apply these rules to every applicable prefix:
 
 | Field | Require |
 |---|---|
-| `protocol` | Use the exact case-sensitive value `verification/v2`. |
+| `protocol` | Use the exact case-sensitive value `verification/v2` for every verification/review receipt. `RECOVERY` instead requires `gatecraft-recovery/v1` and remains outside the chain. |
 | `receipt_id` | Use 1–128 characters matching `[A-Za-z0-9][A-Za-z0-9._:-]*`; keep it unique within the chain. |
 | `verified_by`, `reviewer`, `source_id`, `review_id` | Use a stable 1–128 character identity token; never swap a reviewer within one review identity. |
 | `verified_at`, `reviewed_at` | Use a timezone-qualified ISO-8601 value such as `2026-07-15T10:00:00Z`; include seconds and at most seven fractional digits. |
 | `artifact_sha` | Use exactly 64 uppercase hexadecimal characters from the canonical aggregate recipe below. |
 | `commit`, `main` | Use a full 40- or 64-character lowercase Git object ID. |
+| `external_merge_oid` | For `RECOVERY`, use the full 40- or 64-character lowercase object ID of the exact external merge/commit. |
+| `subject_id` | For `RECOVERY`, use the exact bead ID or stable drift ID matching `[A-Za-z0-9][A-Za-z0-9._:-]*`; it is not a verification identity. |
 | `exit` | Use an unsigned decimal token. Record the actual baseline exit, including nonzero and leading-zero forms; any baseline token containing a digit 1–9 requires `baseline-expected-gap` in both `required` and `evidence`. Require the exact token `0` for integration/premerge and postmerge. |
 | `result` | Use `observed` for baseline and `pass` for integration/premerge and postmerge. |
 | `*_ref` | Name one earlier receipt ID; reject missing, forward, duplicate, or wrong-type targets. |
@@ -156,6 +161,7 @@ Require every row in this table to pass before returning `Decision=pass`:
 | Match candidate content. | Require integration, terminal review pass, and postmerge `artifact_sha` equality. |
 | Preserve evidence requirements. | Require every phase to declare the same requirement set and observe every item. |
 | Find exactly one final receipt last. | Require `VERIFIED phase=postmerge`, valid full SHAs, `exit=0`, and `result=pass`. |
+| Exclude recovery observations. | A `RECOVERY` record is audit-only and blocks this supplied chain; never use it for a missing phase, review, final, reorder, SHA repair, or reference repair. |
 
 Return `Decision=block` whenever any condition fails. Return all deterministic reasons that apply. Do not use current time, elapsed age, network state, randomness, provider state, or external packages to decide validity.
 

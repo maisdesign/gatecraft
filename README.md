@@ -59,6 +59,7 @@ gatecraft/                       # the installable unit — copy this whole fold
 │  ├─ local-guard.md             # cooperative local lock + foreign-change baseline/sweep
 │  ├─ cycle-end.md               # receipt-first cycle-end event and recovery contract
 │  ├─ receipt-protocol.md        # verification/v2 receipts, hashing, review, retry rules
+│  ├─ recovery-protocol.md       # attended external-merge audit; permanently non-qualifying
 │  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
 │  ├─ dispatch-template.md       # the fill-every-field worker prompt
 │  ├─ anti-patterns.md           # lived failures → the rules that prevent them
@@ -76,6 +77,7 @@ gatecraft/                       # the installable unit — copy this whole fold
    ├─ Test-Guard.ps1             # concurrency, foreign-change, process, path, shell-parity gate
    ├─ Test-CycleEnd.ps1          # idempotency, conflict, kill/replay, and shell-parity gate
    ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
+   ├─ Test-RecoveryProtocol.ps1  # attended audit and non-qualification behavioral gate
    └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
 ~~~
@@ -112,6 +114,7 @@ Before committing any change to the skill or its references, maintainers must ru
 pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 ```
 
@@ -164,6 +167,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 │  ├─ local-guard.md             # lock locale cooperativo + baseline/sweep delle modifiche estranee
 │  ├─ cycle-end.md               # evento cycle-end receipt-first e contratto di ripristino
 │  ├─ receipt-protocol.md        # ricevute verification/v2, hash, review e retry
+│  ├─ recovery-protocol.md       # audit attended di merge esterni; mai qualificante
 │  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
 │  ├─ dispatch-template.md       # prompt worker con ogni campo da compilare
 │  ├─ anti-patterns.md           # fallimenti vissuti → regole preventive
@@ -181,6 +185,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
    ├─ Test-Guard.ps1             # gate concorrenza, modifiche estranee, processi, path e parità shell
    ├─ Test-CycleEnd.ps1          # gate idempotenza, conflitti, kill/replay e parità shell
    ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
+   ├─ Test-RecoveryProtocol.ps1  # gate audit attended e non qualificazione
    └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
 ~~~
@@ -217,6 +222,7 @@ Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maint
 pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 ```
 

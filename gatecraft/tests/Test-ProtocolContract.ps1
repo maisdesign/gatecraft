@@ -81,6 +81,7 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $contractPath = Join-Path $repoRoot 'gatecraft/references/execution-contract.md'
 $hygienePath = Join-Path $repoRoot 'gatecraft/references/evidence-hygiene.md'
 $receiptProtocolPath = Join-Path $repoRoot 'gatecraft/references/receipt-protocol.md'
+$recoveryProtocolPath = Join-Path $repoRoot 'gatecraft/references/recovery-protocol.md'
 $cycleEndReferencePath = Join-Path $repoRoot 'gatecraft/references/cycle-end.md'
 $localGuardReferencePath = Join-Path $repoRoot 'gatecraft/references/local-guard.md'
 $protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
@@ -91,6 +92,7 @@ $cycleEndShellPath = Join-Path $repoRoot 'gatecraft/scripts/cycle-end.sh'
 $cycleEndTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-CycleEnd.ps1'
 $guardTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-Guard.ps1'
 $receiptTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-ReceiptProtocol.ps1'
+$recoveryTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-RecoveryProtocol.ps1'
 $skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
 $dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
 $quotaPath = Join-Path $repoRoot 'gatecraft/references/codex-quota.md'
@@ -101,6 +103,7 @@ $gitignorePath = Join-Path $repoRoot '.gitignore'
 $contract = Read-RequiredText -Path $contractPath -Label 'Normative execution contract'
 $hygiene = Read-RequiredText -Path $hygienePath -Label 'Raw-log hygiene reference'
 $receiptProtocol = Read-RequiredText -Path $receiptProtocolPath -Label 'Receipt protocol reference'
+$recoveryProtocol = Read-RequiredText -Path $recoveryProtocolPath -Label 'Recovery protocol reference'
 $cycleEndReference = Read-RequiredText -Path $cycleEndReferencePath -Label 'Cycle-end reference'
 $localGuardReference = Read-RequiredText -Path $localGuardReferencePath -Label 'Local guard reference'
 $protocolModule = Read-RequiredText -Path $protocolModulePath -Label 'Receipt protocol module'
@@ -111,6 +114,7 @@ $cycleEndShell = Read-RequiredText -Path $cycleEndShellPath -Label 'Cycle-end PO
 $cycleEndTest = Read-RequiredText -Path $cycleEndTestPath -Label 'Cycle-end behavioral gate'
 $guardTest = Read-RequiredText -Path $guardTestPath -Label 'Guard behavioral gate'
 $receiptTest = Read-RequiredText -Path $receiptTestPath -Label 'Receipt protocol behavioral gate'
+$recoveryTest = Read-RequiredText -Path $recoveryTestPath -Label 'Recovery protocol behavioral gate'
 $skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
 $dispatch = Read-RequiredText -Path $dispatchPath -Label 'Dispatch template'
 $quota = Read-RequiredText -Path $quotaPath -Label 'Quota adapter reference'
@@ -220,6 +224,44 @@ Assert-Match -Text $contract -Pattern 'Validate the ordered verification/v2 chai
 Assert-Match -Text $contract -Pattern 'Append exactly one `cycle-end` event.+stable event ID.+strictly monotonic positive sequence' -Message 'GC-1.12 must invoke one stable, monotonic cycle-end event.'
 Assert-Match -Text $contract -Pattern 'append-only canonical receipt first.+derive the session-log, heartbeat, snapshot, and dashboard projections only from the validated receipt sequence' -Message 'GC-1.12 must make the receipt authoritative over every projection.'
 Assert-Match -Text $contract -Pattern 'unattended mode fails closed.+attended mode may expose only the documented `automatic_completion=false` manual checklist' -Message 'GC-1.12 must preserve visible mode-specific projection failure behavior.'
+
+# Attended-only external-merge recovery remains an audit observation, never proof.
+Assert-Match -Text $skill -Pattern 'references/recovery-protocol\.md' -Message 'SKILL.md must route explicitly to the recovery protocol.'
+Assert-Match -Text $skill -Pattern 'permanently non-qualifying.+never count or relabel it as integration/premerge.+VERIFIED result=pass.+REVIEW_PASS.+replacement phase.+ordered verification/v2 chain repair' -Message 'SKILL.md must retain the complete recovery non-qualification boundary inline.'
+Assert-Match -Text $skill -Pattern 'exact external merge OID.+bead/drift subject ID.+current artifact.+observation time' -Message 'SKILL.md must bind recovery to both audit subject identifiers.'
+Assert-Match -Text $skill -Pattern 'persist only `ConvertTo-GatecraftRecoveryProjection` output.+omits those free-text fields by default' -Message 'SKILL.md must route durable recovery output through the safe projection.'
+Assert-Match -Text $contract -Pattern 'Only in attended mode and after a direct answer.+gatecraft-recovery/v1.+exact external merge OID.+bead ID or stable drift ID.+current artifact SHA.+observation time.+missing-evidence reason.+direct-user decision' -Message 'GC-0.12 must restrict recovery to a direct attended decision and bind both audit subject identifiers.'
+Assert-Match -Text $contract -Pattern 'persist only the durable-safe projection.+external merge OID.+bead/drift subject ID.+omitted-field markers.+missing-evidence and direct-user free text remains local by default' -Message 'GC-0.12 durable evidence must omit recovery narrative text by default.'
+Assert-Match -Text $contract -Pattern 'Never emit recovery in unattended mode.+never count it as integration/premerge.+postmerge `VERIFIED result=pass`.+`REVIEW_PASS`.+replacement phase.+ordered verification/v2 chain repair' -Message 'GC-0.12 must prohibit every recovery qualification substitute.'
+Assert-Match -Text $recoveryProtocol -Pattern '(?m)^# External-merge recovery \(`gatecraft-recovery/v1`\)' -Message 'Recovery reference must declare its versioned protocol.'
+Assert-Match -Text $recoveryProtocol -Pattern 'RECOVERY protocol=gatecraft-recovery/v1 receipt_id=<id> mode=attended observed_at=<iso8601> external_merge_oid=<git-oid> subject_id=<bead-or-drift-id> artifact_sha=<SHA256> missing_evidence=' -Message 'Recovery reference must define the complete subject-bound record grammar.'
+foreach ($field in @('external_merge_oid', 'subject_id', 'artifact_sha', 'observed_at', 'missing_evidence', 'user_decision')) {
+    Assert-Match -Text $recoveryProtocol -Pattern ([regex]::Escape('| `' + $field + '` |')) -Message "Recovery reference must define field $field."
+}
+Assert-Match -Text $recoveryProtocol -Pattern 'Artifact equality is not subject identity.+same `artifact_sha`.+`external_merge_oid` values differ' -Message 'Recovery reference must distinguish same-artifact external merges.'
+Assert-Match -Text $recoveryProtocol -Pattern 'U\+2028 LINE SEPARATOR.+U\+2029 PARAGRAPH SEPARATOR.+Unicode `Format` \(`Cf`\)' -Message 'Recovery reference must reject separator and format controls in quoted text.'
+Assert-Match -Text $recoveryProtocol -Pattern 'Decision = audit-only' -Message 'Valid recovery validation must return audit-only.'
+Assert-Match -Text $recoveryProtocol -Pattern 'Qualifies = false' -Message 'Valid recovery validation must remain non-qualifying.'
+Assert-Match -Text $recoveryProtocol -Pattern 'verification\.recovery-nonqualifying' -Message 'Recovery reference must expose the stable chain-block reason.'
+Assert-Match -Text $recoveryProtocol -Pattern 'fresh prospective Gatecraft cycle' -Message 'Recovery reference must require fresh prospective proof instead of backfill.'
+Assert-Match -Text $recoveryProtocol -Pattern '(?m)^## Durable-safe projection$' -Message 'Recovery reference must define a dedicated durable-safe projection boundary.'
+Assert-Match -Text $recoveryProtocol -Pattern '(?s)ConvertTo-GatecraftRecoveryProjection.+allowlists only.+external_merge_oid.+subject_id.+omits `missing_evidence` and `user_decision` completely' -Message 'Recovery projection contract must allowlist subject metadata and omit free text.'
+Assert-Match -Text $protocolModule -Pattern '(?m)^function Test-GatecraftRecoveryRecord\s*\{' -Message 'Production validation must implement Test-GatecraftRecoveryRecord.'
+Assert-Match -Text $protocolModule -Pattern '(?m)^function ConvertTo-GatecraftRecoveryProjection\s*\{' -Message 'Production validation must implement the durable-safe recovery projection.'
+Assert-Match -Text $protocolModule -Pattern 'verification\.recovery-nonqualifying' -Message 'Production verification must block every recovery member.'
+Assert-Match -Text $recoveryTest -Pattern 'Import-Module \$modulePath -Force' -Message 'Recovery gate must import the real production module.'
+Assert-Match -Text $recoveryTest -Pattern 'valid recovery audit observation remains non-qualifying' -Message 'Recovery gate must prove a valid audit observation remains non-qualifying.'
+Assert-Match -Text $recoveryTest -Pattern 'Recovery text used as integration/postmerge substitute' -Message 'Recovery gate must cover phase substitution.'
+Assert-Match -Text $recoveryTest -Pattern 'Reordered/SHA-mismatched recovery variant' -Message 'Recovery gate must cover reordered and SHA-mismatched variants.'
+Assert-Match -Text $recoveryTest -Pattern 'same artifact/different external merge remained distinctly bound' -Message 'Recovery gate must distinguish equal artifacts attached to different external merges.'
+foreach ($separator in @('U\+2028', 'U\+2029')) {
+    foreach ($field in @('missing_evidence', 'user_decision')) {
+        Assert-Match -Text $recoveryTest -Pattern ($separator + ' in ' + $field) -Message "Recovery gate must reject $separator in $field."
+    }
+}
+Assert-Match -Text $recoveryTest -Pattern '(?s)U\+202E format control.+U\+2066 format control' -Message 'Recovery gate must reject representative Unicode format controls.'
+Assert-Match -Text $recoveryTest -Pattern 'durable-safe recovery projection omitted sensitive and path-like free text' -Message 'Recovery gate must prove sensitive and path-like narrative text cannot persist.'
+Assert-NotMatch -Text $recoveryTest -Pattern '(?m)^function (?:Test-GatecraftRecoveryRecord|Test-GatecraftVerificationChain)\s*\{' -Message 'Recovery gate must not duplicate production validation logic.'
 
 # Receipt-first cycle-end implementation, entry points, and recovery gate.
 Assert-Match -Text $skill -Pattern 'references/cycle-end\.md' -Message 'SKILL.md must route cycle-end behavior to the focused reference.'
@@ -349,7 +391,8 @@ foreach ($powerShellSource in @(
     [pscustomobject]@{ Label = 'cycle-end.ps1'; Text = $cycleEndScript },
     [pscustomobject]@{ Label = 'Test-Guard.ps1'; Text = $guardTest },
     [pscustomobject]@{ Label = 'Test-CycleEnd.ps1'; Text = $cycleEndTest },
-    [pscustomobject]@{ Label = 'Test-ReceiptProtocol.ps1'; Text = $receiptTest }
+    [pscustomobject]@{ Label = 'Test-ReceiptProtocol.ps1'; Text = $receiptTest },
+    [pscustomobject]@{ Label = 'Test-RecoveryProtocol.ps1'; Text = $recoveryTest }
 )) {
     $tokens = $null
     $parseErrors = $null
@@ -622,6 +665,7 @@ Assert-Match -Text $changelog -Pattern 'Contract-first foundation and five appro
 Assert-Match -Text $changelog -Pattern 'Verification v2, review receipts, and retry classes' -Message 'The verification/v2 revision must amend the current 2026-07-15 entry.'
 Assert-Match -Text $changelog -Pattern 'Receipt-first cycle-end MVP' -Message 'The cycle-end MVP revision must amend the current 2026-07-15 entry.'
 Assert-Match -Text $changelog -Pattern 'Cooperative local guard and foreign-change sweep' -Message 'The local guard revision must amend the current 2026-07-15 entry.'
+Assert-Match -Text $changelog -Pattern 'Attended external-merge recovery audit' -Message 'The recovery protocol revision must be recorded in the changelog.'
 
 # Raw-log ignore boundary and documentation.
 foreach ($pattern in @('log/', '/logs/', '/.llm/runtime/', '/.gatecraft/', '*.attempt-*.log', '*.raw-session.*')) {
@@ -640,6 +684,7 @@ Assert-Match -Text $hygiene -Pattern 'sanitized projection can exclude it or rep
 Assert-Match -Text $hygiene -Pattern 'Allow only sanitized evidence across the durable/shared/public boundary' -Message 'Evidence hygiene must allow only sanitized durable/shared/public evidence.'
 Assert-Match -Text $hygiene -Pattern 'Never publish or commit a raw session log, attempt log, native transcript, local runtime state' -Message 'Evidence hygiene must forbid durable/public raw logs and runtime state.'
 Assert-Match -Text $hygiene -Pattern 'Pass the same known-value table to `Test-GatecraftVerificationChain`' -Message 'Evidence hygiene must route sanitized validation through the production module.'
+Assert-Match -Text $hygiene -Pattern 'Test-GatecraftRecoveryRecord.+raw recovery line.+narrative fields.+detailed audit result local.+ConvertTo-GatecraftRecoveryProjection.+sensitive or path-like narrative content cannot cross the boundary' -Message 'Evidence hygiene must route only the safe recovery projection across the durable boundary.'
 Assert-Match -Text $hygiene -Pattern 'Keep `ConvertFrom-GatecraftReceiptLine` output local/raw' -Message 'Evidence hygiene must keep raw parser output behind the boundary.'
 Assert-Match -Text $contract -Pattern 'user-approved project \.gitignore rule.+local \.git/info/exclude.+outside the repository' -Message 'GC-0.0 must define a non-silent target-repository ignore mechanism.'
 Assert-Match -Text $skill -Pattern 'without silently editing the user''s tracked `\.gitignore`' -Message 'SKILL.md must retain the target-repository ignore boundary inline.'
@@ -669,15 +714,16 @@ if ($italianMatch.Success) {
 Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
 Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
 foreach ($newFile in @(
-    'execution-contract.md', 'local-guard.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md',
+    'execution-contract.md', 'local-guard.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md', 'recovery-protocol.md',
     'Gatecraft.Protocol.psm1', 'guard.ps1', 'guard.sh', 'cycle-end.ps1', 'cycle-end.sh',
-    'Test-Guard.ps1', 'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
+    'Test-Guard.ps1', 'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-RecoveryProtocol.ps1', 'Test-ProtocolContract.ps1'
 )) {
     $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
     Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
 }
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract\.ps1')).Count -ge 2) -Message 'README must give the exact maintainer gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact receipt gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact recovery gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd\.ps1')).Count -ge 2) -Message 'README must give the exact cycle-end gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-Guard\.ps1')).Count -ge 2) -Message 'README must give the exact guard gate command in both languages.'
 

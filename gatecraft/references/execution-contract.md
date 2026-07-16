@@ -131,9 +131,9 @@ Classify every other variation as a capability or a policy, never as another mod
 ### GC-0.12 — External merge drift
 
 - **Trigger:** Complete bootstrap and periodically recheck while selecting work.
-- **Action:** Compare merges and closed beads against exact VERIFIED ... result=pass evidence, classify unmatched work as drift, and ask the user to choose catch-up scope when drift is material.
-- **Evidence:** Record compared ranges, matching pass ledgers, unmatched counts and kinds, and the user's prioritization decision.
-- **Stop:** Stop treating closure, VERIFICATION_FAILED, or missing ledger lines as proof of verification.
+- **Action:** Compare merges and closed beads against exact VERIFIED ... result=pass evidence, classify unmatched work as drift, and ask the user to choose catch-up scope when drift is material. Only in attended mode and after a direct answer, optionally emit one validated `gatecraft-recovery/v1` audit record binding the exact external merge OID, bead ID or stable drift ID, current artifact SHA, explicit observation time, sanitized missing-evidence reason, and sanitized direct-user decision; keep it separate from verification/v2. Keep the raw line and detailed validation result local, and derive durable/shared evidence only with `ConvertTo-GatecraftRecoveryProjection`.
+- **Evidence:** Record compared ranges, matching pass ledgers, unmatched counts and kinds, and the user's prioritization decision. When recovery is emitted, persist only the durable-safe projection containing the recovery ID, external merge OID, bead/drift subject ID, current artifact SHA, observation time, omitted-field markers, and `audit-only` disposition; the missing-evidence and direct-user free text remains local by default.
+- **Stop:** Stop treating closure, VERIFICATION_FAILED, missing ledger lines, or any recovery record as proof of verification. Never emit recovery in unattended mode; never count it as integration/premerge, postmerge `VERIFIED result=pass`, `REVIEW_PASS`, a replacement phase, or an ordered verification/v2 chain repair regardless of position or SHA equality.
 
 ## Step 1 — Per-bead loop
 
@@ -212,7 +212,7 @@ Classify every other variation as a capability or a policy, never as another mod
 - **Trigger:** Record bead state after independent verification and the main gate complete.
 - **Action:** Validate the ordered verification/v2 chain with Gatecraft.Protocol.psm1, lead a passing comment with the backward-compatible VERIFIED ... result=pass postmerge line or a failing comment with VERIFICATION_FAILED ... result=fail, sanitize the receipt-derived projection, close only after Decision=pass, and reopen failures under the retry policy.
 - **Evidence:** Record the exact final ledger line, baseline/integration/review references, machine reason codes, sanitization check, comment identifier, bead status, close or reopen result, and refreshed lock heartbeat.
-- **Stop:** Stop closure when the baseline observation is missing, malformed, conflicting, mislabelled, non-unsigned, misordered, or unreferenced; a nonzero baseline lacks `baseline-expected-gap` in either declared or observed evidence; integration is missing, malformed, nonzero, or non-pass; review is inadmissible or SHA-mismatched; final exit is nonzero; references are broken; no exact final pass ledger exists; or closure triggers irreversible effects before verification.
+- **Stop:** Stop closure when the baseline observation is missing, malformed, conflicting, mislabelled, non-unsigned, misordered, or unreferenced; a nonzero baseline lacks `baseline-expected-gap` in either declared or observed evidence; integration is missing, malformed, nonzero, or non-pass; review is inadmissible or SHA-mismatched; final exit is nonzero; references are broken; no exact final pass ledger exists; a `RECOVERY` record is supplied as qualification or chain repair; or closure triggers irreversible effects before verification.
 
 ### GC-1.12 — Cycle-end persistence
 

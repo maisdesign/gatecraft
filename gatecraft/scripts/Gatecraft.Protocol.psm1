@@ -91,6 +91,18 @@ function Get-GatecraftReceiptSchema {
                 )
             }
         }
+        'RECOVERY' {
+            return [pscustomobject]@{
+                Required = @(
+                    'protocol', 'receipt_id', 'mode', 'observed_at', 'external_merge_oid',
+                    'subject_id', 'artifact_sha', 'missing_evidence', 'user_decision'
+                )
+                Allowed = @(
+                    'protocol', 'receipt_id', 'mode', 'observed_at', 'external_merge_oid',
+                    'subject_id', 'artifact_sha', 'missing_evidence', 'user_decision'
+                )
+            }
+        }
         { $_ -in @('REVIEW_PASS', 'REVIEW_BLOCK', 'REVIEW_INCONCLUSIVE') } {
             $allowed = @(
                 'protocol', 'receipt_id', 'reviewer', 'reviewed_at', 'source_id',
@@ -322,6 +334,187 @@ function Get-GatecraftField {
     return $null
 }
 
+function Test-GatecraftRecoveryQuotedText {
+    param([AllowNull()][string] $Value)
+
+    if (
+        [string]::IsNullOrWhiteSpace($Value) -or
+        $Value.Length -gt 2048 -or
+        $Value -cne $Value.Trim()
+    ) {
+        return $false
+    }
+
+    try {
+        if (-not $Value.IsNormalized([Text.NormalizationForm]::FormC)) {
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+
+    $offset = 0
+    while ($offset -lt $Value.Length) {
+        $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($Value, $offset)
+        if (
+            $category -eq [Globalization.UnicodeCategory]::Control -or
+            $category -eq [Globalization.UnicodeCategory]::Format -or
+            $category -eq [Globalization.UnicodeCategory]::LineSeparator -or
+            $category -eq [Globalization.UnicodeCategory]::ParagraphSeparator -or
+            $category -eq [Globalization.UnicodeCategory]::Surrogate
+        ) {
+            return $false
+        }
+
+        if ([char]::IsHighSurrogate($Value[$offset])) {
+            if ($offset + 1 -ge $Value.Length -or -not [char]::IsLowSurrogate($Value[$offset + 1])) {
+                return $false
+            }
+            $offset += 2
+        }
+        elseif ([char]::IsLowSurrogate($Value[$offset])) {
+            return $false
+        }
+        else {
+            $offset++
+        }
+    }
+
+    return $true
+}
+
+function Add-GatecraftRecoveryIssues {
+    param(
+        [Parameter(Mandatory)] $Record,
+        [Parameter(Mandatory)][AllowEmptyCollection()][Collections.Generic.List[object]] $Issues,
+        [hashtable] $KnownSecret = @{}
+    )
+
+    if ((Get-GatecraftField -Receipt $Record -Name 'protocol') -cne 'gatecraft-recovery/v1') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.protocol-invalid' -Message "Line $($Record.LineNumber) must declare protocol gatecraft-recovery/v1." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    $id = Get-GatecraftField -Receipt $Record -Name 'receipt_id'
+    if ($id -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.id-malformed' -Message "Line $($Record.LineNumber) has a malformed recovery receipt_id." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    if ((Get-GatecraftField -Receipt $Record -Name 'mode') -cne 'attended') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.mode-not-attended' -Message "Line $($Record.LineNumber) recovery records are permitted only with mode=attended." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    $observedAt = Get-GatecraftField -Receipt $Record -Name 'observed_at'
+    if (-not (Test-GatecraftIso8601 -Value $observedAt)) {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.timestamp-invalid' -Message "Line $($Record.LineNumber) observed_at is not a valid timezone-qualified ISO-8601 timestamp." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    $externalMergeOid = Get-GatecraftField -Receipt $Record -Name 'external_merge_oid'
+    if ($externalMergeOid -cnotmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.external-merge-oid-invalid' -Message "Line $($Record.LineNumber) external_merge_oid must be a full lowercase Git object ID." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    $subjectId = Get-GatecraftField -Receipt $Record -Name 'subject_id'
+    if ($subjectId -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.subject-id-malformed' -Message "Line $($Record.LineNumber) subject_id must identify the exact bead or external-merge drift subject." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    $artifactHash = Get-GatecraftField -Receipt $Record -Name 'artifact_sha'
+    if ($artifactHash -cnotmatch '^[0-9A-F]{64}$') {
+        $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.artifact-hash-invalid' -Message "Line $($Record.LineNumber) artifact_sha must be exactly 64 uppercase hexadecimal characters." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+    }
+
+    foreach ($field in @('missing_evidence', 'user_decision')) {
+        if (-not $Record.Quoted.Contains($field) -or -not $Record.Quoted[$field]) {
+            $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.quoting-required' -Message "Line $($Record.LineNumber) field '$field' must be quoted." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+        }
+        $value = Get-GatecraftField -Receipt $Record -Name $field
+        if (-not (Test-GatecraftRecoveryQuotedText -Value $value)) {
+            $Issues.Add((New-GatecraftProtocolIssue -Code 'recovery.text-invalid' -Message "Line $($Record.LineNumber) field '$field' must be nonempty, trimmed NFC text of at most 2048 characters without controls, Unicode format characters, or line/paragraph separators." -Line $Record.LineNumber -KnownSecret $KnownSecret))
+        }
+    }
+}
+
+function Test-GatecraftRecoveryRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Record,
+        [hashtable] $KnownSecret = @{}
+    )
+
+    $issues = [Collections.Generic.List[object]]::new()
+    $parsed = ConvertFrom-GatecraftReceiptLine -Line $Record -KnownSecret $KnownSecret
+    foreach ($errorItem in $parsed.Errors) {
+        $issues.Add($errorItem)
+    }
+
+    if ($parsed.Type -cne 'RECOVERY') {
+        $issues.Add((New-GatecraftProtocolIssue -Code 'recovery.prefix-invalid' -Message 'The supplied line is not a RECOVERY record.' -Line 1 -KnownSecret $KnownSecret))
+    }
+    else {
+        Add-GatecraftRecoveryIssues -Record $parsed -Issues $issues -KnownSecret $KnownSecret
+    }
+
+    $safeFields = [ordered]@{}
+    foreach ($key in $parsed.Fields.Keys) {
+        $safeFields[$key] = Protect-GatecraftText -Text $parsed.Fields[$key] -KnownSecret $KnownSecret
+    }
+    $isValid = ($issues.Count -eq 0)
+
+    [pscustomobject][ordered]@{
+        Protocol = 'gatecraft-recovery/v1'
+        IsValid = $isValid
+        Decision = if ($isValid) { 'audit-only' } else { 'block' }
+        Qualifies = $false
+        QualificationReason = 'recovery.audit-only'
+        Reasons = @($issues | ForEach-Object { $_.Code })
+        Errors = @($issues)
+        Record = [pscustomobject][ordered]@{
+            Prefix = $parsed.Type
+            Line = $parsed.LineNumber
+            IsValid = $parsed.IsValid
+            Fields = $safeFields
+        }
+    }
+}
+
+function ConvertTo-GatecraftRecoveryProjection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $ValidationResult,
+        [hashtable] $KnownSecret = @{}
+    )
+
+    $record = $ValidationResult.Record
+    $fieldProjection = [ordered]@{}
+    foreach ($key in @('receipt_id', 'mode', 'observed_at', 'external_merge_oid', 'subject_id', 'artifact_sha')) {
+        if ($null -ne $record -and $null -ne $record.Fields -and $record.Fields.Contains($key)) {
+            $fieldProjection[$key] = Protect-GatecraftText -Text $record.Fields[$key] -KnownSecret $KnownSecret
+        }
+    }
+
+    $reasonProjection = foreach ($reason in @($ValidationResult.Reasons)) {
+        Protect-GatecraftText -Text $reason -KnownSecret $KnownSecret
+    }
+    $projection = [ordered]@{
+        protocol = 'gatecraft-recovery/v1'
+        decision = if ([bool] $ValidationResult.IsValid) { 'audit-only' } else { 'block' }
+        valid = [bool] $ValidationResult.IsValid
+        qualifies = $false
+        qualification_reason = 'recovery.audit-only'
+        reasons = @($reasonProjection)
+        record = [ordered]@{
+            prefix = if ($null -ne $record -and $record.Prefix -ceq 'RECOVERY') { 'RECOVERY' } else { '' }
+            line = if ($null -ne $record) { [int] $record.Line } else { 0 }
+            fields = $fieldProjection
+            omitted_fields = @('missing_evidence', 'user_decision')
+        }
+    }
+
+    $json = $projection | ConvertTo-Json -Depth 8 -Compress
+    return Protect-GatecraftText -Text $json -KnownSecret $KnownSecret
+}
+
 function Test-GatecraftVerificationChain {
     [CmdletBinding()]
     param(
@@ -362,6 +555,11 @@ function Test-GatecraftVerificationChain {
     }
 
     foreach ($item in $parsed) {
+        if ($item.Type -ceq 'RECOVERY') {
+            Add-GatecraftRecoveryIssues -Record $item -Issues $issues -KnownSecret $KnownSecret
+            continue
+        }
+
         $protocol = Get-GatecraftField -Receipt $item -Name 'protocol'
         if ($null -ne $protocol -and $protocol -cne 'verification/v2') {
             $issues.Add((New-GatecraftProtocolIssue -Code 'receipt.protocol-invalid' -Message "Line $($item.LineNumber) does not declare protocol verification/v2." -Line $item.LineNumber -KnownSecret $KnownSecret))
@@ -412,6 +610,11 @@ function Test-GatecraftVerificationChain {
     $integrations = @($phaseReceipts | Where-Object { (Get-GatecraftField -Receipt $_ -Name 'phase') -ceq 'integration/premerge' })
     $finals = @($parsed | Where-Object { $_.Type -eq 'VERIFIED' })
     $reviews = @($parsed | Where-Object { $_.Type -in @('REVIEW_PASS', 'REVIEW_BLOCK', 'REVIEW_INCONCLUSIVE', 'REVIEW_CLARIFY') })
+    $recoveries = @($parsed | Where-Object { $_.Type -eq 'RECOVERY' })
+
+    foreach ($item in $recoveries) {
+        $issues.Add((New-GatecraftProtocolIssue -Code 'verification.recovery-nonqualifying' -Message "Line $($item.LineNumber) is an audit-only RECOVERY record and cannot participate in or repair verification/v2." -Line $item.LineNumber -KnownSecret $KnownSecret))
+    }
 
     if ($baselines.Count -ne 1) {
         $issues.Add((New-GatecraftProtocolIssue -Code 'verification.baseline-count' -Message "Require exactly one baseline observation receipt; found $($baselines.Count)." -KnownSecret $KnownSecret))
@@ -970,6 +1173,8 @@ function Resolve-GatecraftRetrySequence {
 Export-ModuleMember -Function @(
     'Protect-GatecraftText',
     'ConvertFrom-GatecraftReceiptLine',
+    'Test-GatecraftRecoveryRecord',
+    'ConvertTo-GatecraftRecoveryProjection',
     'Test-GatecraftVerificationChain',
     'ConvertTo-GatecraftDashboardProjection',
     'Get-GatecraftAggregateFingerprint',

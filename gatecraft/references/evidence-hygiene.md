@@ -34,6 +34,7 @@ Apply this boundary to the GC-0.0 session log, GC-1.7 attempt logs, native agent
 - Import `scripts/Gatecraft.Protocol.psm1` under PowerShell 7 or later before emitting receipt-derived or dashboard-safe output.
 - Pass already-known values to `Protect-GatecraftText` with a non-secret type label and replace exact values with typed markers such as `[REDACTED_TOKEN]`; never read a secret file merely to populate the replacement table.
 - Pass the same known-value table to `Test-GatecraftVerificationChain` so its machine result and validation errors contain sanitized receipt fields.
+- Pass that table to `Test-GatecraftRecoveryRecord` as well; keep the raw recovery line, both narrative fields, and the detailed audit result local. Persist only `ConvertTo-GatecraftRecoveryProjection` output, whose default allowlist retains the external merge/bead-or-drift identifiers while omitting the missing-evidence and direct-user free text so sensitive or path-like narrative content cannot cross the boundary.
 - Build dashboard JSON only with `ConvertTo-GatecraftDashboardProjection`, then re-sanitize that projection before writing it.
 - Keep `ConvertFrom-GatecraftReceiptLine` output local/raw; never publish parser fields directly.
 - Treat deterministic exact-value replacement as one boundary control, not secret discovery; retain the broader scanning, access, retention, and wrapper-level controls above.
