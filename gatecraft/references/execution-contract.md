@@ -155,7 +155,7 @@ Classify every other variation as a capability or a policy, never as another mod
 
 - **Trigger:** Enter worktree preparation after approving the bead's overlap plan.
 - **Action:** Create a fresh attempt-scoped worktree and branch at the GC-0.3 absolute path, verify the shared bd database from inside it, seed only known-good ignored dependencies when needed, and preserve the user's existing work.
-- **Evidence:** Record the absolute path, branch, attempt number, base SHA, bd root/database identity, and clean-or-approved status.
+- **Evidence:** Record the absolute path, branch, attempt number, base SHA, `bd where` path plus `bd context` project/database identity, and clean-or-approved status.
 - **Stop:** Stop dispatch when the path violates the platform rule, the worktree or bd identity mismatches, or user changes overlap scope.
 
 ### GC-1.4 — Premise and baseline gate

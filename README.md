@@ -78,6 +78,7 @@ gatecraft/                       # the installable unit — copy this whole fold
    ├─ Test-CycleEnd.ps1          # idempotency, conflict, kill/replay, and shell-parity gate
    ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
    ├─ Test-RecoveryProtocol.ps1  # attended audit and non-qualification behavioral gate
+   ├─ Test-All.ps1               # fail-fast integrated runner for every Gatecraft gate
    └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
 ~~~
@@ -111,11 +112,15 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 Before committing any change to the skill or its references, maintainers must run all dependency-free protocol gates from the repository root:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-All.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+git diff --check
+git add -- <intended-paths>
+git diff --cached --check
 ```
 
 ### License
@@ -186,6 +191,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
    ├─ Test-CycleEnd.ps1          # gate idempotenza, conflitti, kill/replay e parità shell
    ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
    ├─ Test-RecoveryProtocol.ps1  # gate audit attended e non qualificazione
+   ├─ Test-All.ps1               # runner integrato fail-fast per tutti i gate Gatecraft
    └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
 ~~~
@@ -219,11 +225,15 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire tutti i gate del protocollo senza dipendenze dalla root del repository:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-All.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+git diff --check
+git add -- <percorsi-intenzionali>
+git diff --cached --check
 ```
 
 ### Licenza
