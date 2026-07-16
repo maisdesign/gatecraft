@@ -451,6 +451,23 @@ try {
     & git -C $foreignRepo diff --cached --quiet --
     Assert-Equal $LASTEXITCODE 0 'Sweep must not stage any path.'
 
+    # Repository config must not hide a dirty submodule from the foreign-change sweep.
+    $submoduleSource = New-TestRepository 'submodule-source-repo'
+    $submoduleParent = New-TestRepository 'submodule-foreign-parent'
+    Invoke-Git $submoduleParent -c protocol.file.allow=always submodule add $submoduleSource vendor/dep | Out-Null
+    Invoke-Git $submoduleParent add .gitmodules vendor/dep | Out-Null
+    Invoke-Git $submoduleParent commit -m add-submodule | Out-Null
+    Invoke-Git $submoduleParent config submodule.vendor/dep.ignore all | Out-Null
+    $submoduleWorker = Start-TestSleeper
+    $submoduleState = Join-Path $testRoot 'submodule-foreign-state'
+    Assert-Equal (Invoke-Guard -Arguments (New-BaselineArguments -Repository $submoduleParent -StateRoot $submoduleState -BaselineId submoduleforeign -Manifest (New-ManifestJson $submoduleWorker))).ExitCode 0 'Submodule baseline must pass before a foreign edit.'
+    $submoduleForeignPath = Join-Path $submoduleParent 'vendor/dep/foreign.txt'
+    $submoduleForeignBytes = $utf8.GetBytes("hidden-submodule-foreign-edit`n")
+    Invoke-ThirdShellWrite -Path $submoduleForeignPath -Bytes $submoduleForeignBytes
+    $submoduleSweep = Invoke-Guard -Arguments (New-SweepArguments -Repository $submoduleParent -StateRoot $submoduleState -BaselineId submoduleforeign)
+    Assert-True ($submoduleSweep.ExitCode -ne 0 -and $submoduleSweep.Error -match 'code=foreign-change') 'A configured ignored submodule edit must block visibly.'
+    Assert-True (Test-BytesEqual ([IO.File]::ReadAllBytes($submoduleForeignPath)) $submoduleForeignBytes) 'Blocked submodule sweep must preserve foreign bytes.'
+
     # Movement of refs/heads/main blocks and does not rewrite history.
     $mainRepo = New-TestRepository 'main-movement-repo'
     $mainWorker = Start-TestSleeper
