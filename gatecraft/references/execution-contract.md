@@ -61,7 +61,7 @@ Classify every other variation as a capability or a policy, never as another mod
 ### GC-0.2 — Profile and orchestrator capabilities
 
 - **Trigger:** Continue bootstrap after establishing usable bd shared state.
-- **Action:** Enumerate every configured vendor profile, assign canonical slugs, identify the current orchestrator, record exact launch/PID/process-group/start/reap manifests, and smoke-test self-identification, usage (including separate short-session and weekly window availability), non-interactive launch, ACK, process-tree reap, and write capabilities for every candidate seat without requiring every usage window to be available.
+- **Action:** Enumerate every configured vendor profile, assign canonical slugs, identify the current orchestrator, load and classify the local `model-catalog/v1` record under `model-catalog.md` (including 72-hour freshness and startup-only refresh authority), record exact launch/PID/process-group/start/reap manifests, and smoke-test self-identification, usage (including separate short-session and weekly window availability), non-interactive launch, ACK, process-tree reap, and write capabilities for every candidate seat without requiring every usage window to be available.
 - **Evidence:** Record vendor counts, labels, slugs, manual-dispatch-only classifications, role choices, per-window usage capability results, and exact tested invocations.
 - **Stop:** Stop automatic dispatch or succession for any profile that cannot launch, identify itself, ACK, or reap reliably; classify it by capability instead of inventing another mode.
 
