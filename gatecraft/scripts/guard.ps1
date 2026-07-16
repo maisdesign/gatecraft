@@ -536,8 +536,7 @@ function Get-MainSha {
 
 function Get-StatusBytes {
     param([Parameter(Mandatory)][string] $RepositoryRoot)
-    # Never honor repository config that hides dirty submodules from a foreign-change sweep.
-    return ,(Invoke-GitBytes -RepositoryRoot $RepositoryRoot -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none') -FailureCode 'git-status-failed')
+    return ,(Invoke-GitBytes -RepositoryRoot $RepositoryRoot -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=all') -FailureCode 'git-status-failed')
 }
 
 function ConvertFrom-StatusPathBytes {
