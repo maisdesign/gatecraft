@@ -82,10 +82,14 @@ $contractPath = Join-Path $repoRoot 'gatecraft/references/execution-contract.md'
 $hygienePath = Join-Path $repoRoot 'gatecraft/references/evidence-hygiene.md'
 $receiptProtocolPath = Join-Path $repoRoot 'gatecraft/references/receipt-protocol.md'
 $cycleEndReferencePath = Join-Path $repoRoot 'gatecraft/references/cycle-end.md'
+$localGuardReferencePath = Join-Path $repoRoot 'gatecraft/references/local-guard.md'
 $protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
+$guardScriptPath = Join-Path $repoRoot 'gatecraft/scripts/guard.ps1'
+$guardShellPath = Join-Path $repoRoot 'gatecraft/scripts/guard.sh'
 $cycleEndScriptPath = Join-Path $repoRoot 'gatecraft/scripts/cycle-end.ps1'
 $cycleEndShellPath = Join-Path $repoRoot 'gatecraft/scripts/cycle-end.sh'
 $cycleEndTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-CycleEnd.ps1'
+$guardTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-Guard.ps1'
 $receiptTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-ReceiptProtocol.ps1'
 $skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
 $dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
@@ -98,10 +102,14 @@ $contract = Read-RequiredText -Path $contractPath -Label 'Normative execution co
 $hygiene = Read-RequiredText -Path $hygienePath -Label 'Raw-log hygiene reference'
 $receiptProtocol = Read-RequiredText -Path $receiptProtocolPath -Label 'Receipt protocol reference'
 $cycleEndReference = Read-RequiredText -Path $cycleEndReferencePath -Label 'Cycle-end reference'
+$localGuardReference = Read-RequiredText -Path $localGuardReferencePath -Label 'Local guard reference'
 $protocolModule = Read-RequiredText -Path $protocolModulePath -Label 'Receipt protocol module'
+$guardScript = Read-RequiredText -Path $guardScriptPath -Label 'Guard PowerShell entry point'
+$guardShell = Read-RequiredText -Path $guardShellPath -Label 'Guard POSIX entry point'
 $cycleEndScript = Read-RequiredText -Path $cycleEndScriptPath -Label 'Cycle-end PowerShell entry point'
 $cycleEndShell = Read-RequiredText -Path $cycleEndShellPath -Label 'Cycle-end POSIX entry point'
 $cycleEndTest = Read-RequiredText -Path $cycleEndTestPath -Label 'Cycle-end behavioral gate'
+$guardTest = Read-RequiredText -Path $guardTestPath -Label 'Guard behavioral gate'
 $receiptTest = Read-RequiredText -Path $receiptTestPath -Label 'Receipt protocol behavioral gate'
 $skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
 $dispatch = Read-RequiredText -Path $dispatchPath -Label 'Dispatch template'
@@ -245,6 +253,55 @@ Assert-Match -Text $cycleEndTest -Pattern 'ProcessStartInfo' -Message 'Cycle-end
 Assert-Match -Text $cycleEndTest -Pattern 'Kill\(\$true\)' -Message 'Cycle-end gate must kill the exact failpoint child process tree.'
 Assert-Match -Text $cycleEndTest -Pattern 'Refuse fixture cleanup outside the exact unique temp root' -Message 'Cycle-end gate must verify cleanup targets before deletion.'
 
+# Cooperative local guard, foreign-change sweep, and exact call sites.
+Assert-Match -Text $skill -Pattern 'references/local-guard\.md' -Message 'SKILL.md must route to the focused local guard reference.'
+Assert-Match -Text $skill -Pattern 'cooperative and same-host/same-common-directory only.+neither replaces the durable best-effort handoff state nor joins verification/v2 or the canonical cycle-end ledger' -Message 'SKILL.md must retain the honest local guard authority boundary.'
+Assert-Match -Text $contract -Pattern 'Before the first conforming orchestration action, acquire the cooperative local guard' -Message 'Execution contract must acquire before orchestration.'
+Assert-Match -Text $contract -Pattern 'immediately before dispatch create the separate create-only foreign-change baseline' -Message 'GC-1.4 must create the foreign baseline before dispatch.'
+Assert-Match -Text $contract -Pattern 'run the read-only dispatch-baseline foreign-change sweep immediately before commit/merge' -Message 'GC-1.10 must sweep immediately before commit/merge.'
+Assert-Match -Text $contract -Pattern 'create a second create-only postmerge foreign baseline under a fresh ID' -Message 'GC-1.10 must rebaseline only after verified authorized main movement.'
+Assert-Match -Text $contract -Pattern 'only after the read-only sweep of GC-1\.10.s fresh postmerge foreign baseline immediately before cycle-end exits zero' -Message 'GC-1.12 must sweep the postmerge baseline before cycle-end.'
+Assert-Match -Text $contract -Pattern 'release the cooperative local guard only by its exact owner after a terminal/local boundary' -Message 'GC-1.12 must restrict release to the exact owner after the boundary.'
+Assert-Match -Text $localGuardReference -Pattern '(?m)^# Cooperative local guard \(`gatecraft-local-lock/v1`\)' -Message 'Local guard reference must declare the lock protocol.'
+Assert-Match -Text $localGuardReference -Pattern 'exclusive `CreateNew` open' -Message 'Local guard reference must define exclusive creation.'
+Assert-Match -Text $localGuardReference -Pattern 'no automatic steal or stale recovery' -Message 'Local guard reference must prohibit stale auto-recovery.'
+Assert-Match -Text $localGuardReference -Pattern 'complete raw bytes and SHA-256 of `git status --porcelain=v1 -z --untracked-files=all`' -Message 'Local guard reference must define the complete raw status baseline.'
+Assert-Match -Text $localGuardReference -Pattern 'owned paths, expected-process worker IDs, parsed Git dirty paths, and recursive directory entries.+`StringComparer\.Ordinal`.+independent of `CurrentCulture` and `CurrentUICulture`' -Message 'Local guard reference must define explicit ordinal canonical and hash ordering.'
+Assert-Match -Text $localGuardReference -Pattern 'A finding is observation only' -Message 'Local guard reference must preserve foreign paths.'
+Assert-Match -Text $localGuardReference -Pattern 'no distributed compare-and-swap, fencing token, cross-host claim.+daemon, timer.+non-conforming writer' -Message 'Local guard reference must state the honest cooperative boundary.'
+Assert-Match -Text $cycleEndReference -Pattern 'separate `local-guard\.md` sweep of GC-1\.10.s fresh verified-postmerge baseline exits zero' -Message 'Cycle-end must document its explicit preceding guard sweep.'
+Assert-Match -Text $cycleEndReference -Pattern 'Cycle-end never acquires, releases, reads, or becomes authoritative over that guard' -Message 'Cycle-end must remain separate from the guard.'
+Assert-Match -Text $guardScript -Pattern "rev-parse', '--path-format=absolute', '--git-common-dir'" -Message 'Guard must root the lock at Git common-dir.'
+Assert-Match -Text $guardScript -Pattern '\[IO\.FileMode\]::CreateNew' -Message 'Guard must use exclusive create for lock/baseline writes.'
+Assert-Match -Text $guardScript -Pattern "protocol = 'gatecraft-local-lock/v1'" -Message 'Guard must persist the versioned lock record.'
+Assert-Match -Text $guardScript -Pattern "@\('status', '--porcelain=v1', '-z', '--untracked-files=all'\)" -Message 'Guard must capture exact complete porcelain state.'
+Assert-Match -Text $guardScript -Pattern '@\(''--literal-pathspecs'', ''ls-files'', ''--stage'', ''-z'', ''--'', \$RelativePath\)' -Message 'Guard must fingerprint exact dirty-path index entries.'
+Assert-Match -Text $guardScript -Pattern "GIT_OPTIONAL_LOCKS.*= '0'" -Message 'Guard Git reads must disable optional locks.'
+Assert-Match -Text $guardScript -Pattern 'state-root-repository-overlap' -Message 'Guard must reject local evidence roots inside the checkout/common-dir.'
+Assert-Match -Text $guardScript -Pattern 'sweep-repository-raced' -Message 'Guard sweep must fail closed when its observation races.'
+Assert-Match -Text $guardScript -Pattern 'lock-stale-attended-recovery-required' -Message 'Guard must surface stale state without stealing.'
+Assert-Match -Text $guardScript -Pattern 'GUARD_FAILED code=\$Code' -Message 'Guard must emit stable machine failure markers.'
+Assert-NotMatch -Text $guardScript -Pattern "(?i)'(?:add|checkout|reset|restore|stash|clean|revert|mv|rm|commit|merge)'" -Message 'Production guard must not invoke forbidden Git mutations.'
+Assert-Match -Text $guardShell -Pattern '(?m)^#!/bin/sh\s*$' -Message 'Guard shell entry point must use a POSIX shell.'
+Assert-Match -Text $guardShell -Pattern 'exec pwsh -NoLogo -NoProfile -File "\$script_dir/guard\.ps1" "\$@"' -Message 'Guard shell entry point must preserve arguments and exit status.'
+Assert-Match -Text $guardTest -Pattern 'C:\\Program Files\\Git\\bin\\bash\.exe' -Message 'Guard test must select exact Git for Windows Bash.'
+Assert-Match -Text $guardTest -Pattern '\$bashCommand = Get-Command bash -CommandType Application' -Message 'Guard test must resolve Bash from PATH on POSIX.'
+Assert-Match -Text $guardTest -Pattern 'GATECRAFT_GUARD_TEST_CONTROLS' -Message 'Guard test must exercise the exact test-control opt-in.'
+Assert-Match -Text $guardTest -Pattern '(?s)acquire-barrier.+ready-one.+ready-two' -Message 'Guard test must release two real acquisitions from one barrier.'
+Assert-Match -Text $guardTest -Pattern 'Wrong-token release must leave the record byte-identical' -Message 'Guard test must prove wrong-token byte preservation.'
+Assert-Match -Text $guardTest -Pattern 'Invoke-ThirdShellWrite' -Message 'Guard test must edit the foreign path from a third shell.'
+Assert-Match -Text $guardTest -Pattern 'Blocked sweep must leave foreign bytes exact' -Message 'Guard test must hash the foreign path across a blocked sweep.'
+Assert-Match -Text $guardTest -Pattern 'Further byte changes under identical status must block' -Message 'Guard test must detect dirty worktree bytes under stable status.'
+Assert-Match -Text $guardTest -Pattern 'Changed index bytes under identical status/worktree bytes must block' -Message 'Guard test must detect dirty index bytes under stable status and worktree content.'
+Assert-Match -Text $guardTest -Pattern "CultureName 'de-DE'" -Message 'Guard test must baseline under an explicit de-DE child culture.'
+Assert-Match -Text $guardTest -Pattern "CultureName 'sv-SE'" -Message 'Guard test must baseline under an explicit sv-SE child culture.'
+Assert-Match -Text $guardTest -Pattern 'canonical baseline records must be byte-identical' -Message 'Guard test must prove exact cross-culture canonical byte equality.'
+Assert-Match -Text $guardTest -Pattern 'process-start-mismatch' -Message 'Guard test must reject a live PID with the wrong start.'
+Assert-Match -Text $guardTest -Pattern 'New-Item -ItemType Junction' -Message 'Guard test must reject a Windows junction guard path.'
+Assert-Match -Text $guardTest -Pattern 'New-Item -ItemType SymbolicLink' -Message 'Guard test must reject the POSIX symlink equivalent.'
+Assert-Match -Text $guardTest -Pattern 'Kill\(\$true\)' -Message 'Guard test must reap real child process trees.'
+Assert-Match -Text $guardTest -Pattern 'Refuse fixture cleanup outside the exact unique temp root' -Message 'Guard test must constrain cleanup to its fixture root.'
+
 $receiptLineCount = @($receiptProtocol -split '\r?\n').Count
 Assert-True -Condition ($receiptLineCount -gt 100) -Message 'Receipt protocol must use the requested detailed progressive-disclosure reference.'
 Assert-Match -Text $receiptProtocol -Pattern '(?m)^## Table of contents\s*$' -Message 'Receipt protocol exceeds 100 lines and must contain a table of contents.'
@@ -288,7 +345,9 @@ Assert-Match -Text $receiptTest -Pattern "New-Item -ItemType SymbolicLink" -Mess
 
 foreach ($powerShellSource in @(
     [pscustomobject]@{ Label = 'Gatecraft.Protocol.psm1'; Text = $protocolModule },
+    [pscustomobject]@{ Label = 'guard.ps1'; Text = $guardScript },
     [pscustomobject]@{ Label = 'cycle-end.ps1'; Text = $cycleEndScript },
+    [pscustomobject]@{ Label = 'Test-Guard.ps1'; Text = $guardTest },
     [pscustomobject]@{ Label = 'Test-CycleEnd.ps1'; Text = $cycleEndTest },
     [pscustomobject]@{ Label = 'Test-ReceiptProtocol.ps1'; Text = $receiptTest }
 )) {
@@ -562,6 +621,7 @@ Assert-Match -Text $changelog -Pattern 'Renamed .+ to Gatecraft, published under
 Assert-Match -Text $changelog -Pattern 'Contract-first foundation and five approved tweaks' -Message 'The substantive contract-first change must be appended to 2026-07-15.'
 Assert-Match -Text $changelog -Pattern 'Verification v2, review receipts, and retry classes' -Message 'The verification/v2 revision must amend the current 2026-07-15 entry.'
 Assert-Match -Text $changelog -Pattern 'Receipt-first cycle-end MVP' -Message 'The cycle-end MVP revision must amend the current 2026-07-15 entry.'
+Assert-Match -Text $changelog -Pattern 'Cooperative local guard and foreign-change sweep' -Message 'The local guard revision must amend the current 2026-07-15 entry.'
 
 # Raw-log ignore boundary and documentation.
 foreach ($pattern in @('log/', '/logs/', '/.llm/runtime/', '/.gatecraft/', '*.attempt-*.log', '*.raw-session.*')) {
@@ -609,9 +669,9 @@ if ($italianMatch.Success) {
 Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
 Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
 foreach ($newFile in @(
-    'execution-contract.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md',
-    'Gatecraft.Protocol.psm1', 'cycle-end.ps1', 'cycle-end.sh',
-    'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
+    'execution-contract.md', 'local-guard.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md',
+    'Gatecraft.Protocol.psm1', 'guard.ps1', 'guard.sh', 'cycle-end.ps1', 'cycle-end.sh',
+    'Test-Guard.ps1', 'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1'
 )) {
     $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
     Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
@@ -619,6 +679,7 @@ foreach ($newFile in @(
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract\.ps1')).Count -ge 2) -Message 'README must give the exact maintainer gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact receipt gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd\.ps1')).Count -ge 2) -Message 'README must give the exact cycle-end gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-Guard\.ps1')).Count -ge 2) -Message 'README must give the exact guard gate command in both languages.'
 
 if ($failures.Count -gt 0) {
     [Console]::Error.WriteLine("Protocol contract gate failed with $($failures.Count) issue(s):")

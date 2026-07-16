@@ -40,7 +40,7 @@ Hand a backlog to a swarm of agents and the failure mode is always the same: som
 | 🎯 **Gate before dispatch** | A concrete, mechanical definition of done (existing test → targeted script → real-runtime check) is written *before* the worker starts — never a prose task description. |
 | 🧬 **Isolate, then reconcile** | Every bead gets its own worktree; before merge, main is re-integrated and the gate re-runs on the combined result *and* on main itself. |
 | 🔍 **Review ≠ gate** | Behavior gate and security/design review are separate; sensitive paths (auth, payments, secrets, personal data) always get an adversarial reviewer from a *different* profile. |
-| 🤝 **Handoff as temporary regency** | On rate-limit exhaustion the orchestrator role is handed off with a durable snapshot and reclaimed later — with a best-effort lock, heartbeat/staleness rules, and ACK windows to avoid two orchestrators acting at once. |
+| 🤝 **Handoff as temporary regency** | On rate-limit exhaustion the orchestrator role is handed off with a durable snapshot and reclaimed later — with a cooperative same-host Git-common-dir guard, durable best-effort lock, heartbeat/staleness rules, and ACK windows. |
 | 🌙 **Safe unattended operation** | Silence is never authorization. Standing policies decided at bootstrap (succession, worker-exhaustion, unattended ceiling, push/deploy) resolve only what the user explicitly delegated. |
 
 ### Orchestrator seat compatibility
@@ -56,6 +56,7 @@ gatecraft/                       # the installable unit — copy this whole fold
 ├─ SKILL.md                      # core protocol, inline safety invariants, contract routing
 ├─ references/
 │  ├─ execution-contract.md      # normative GC-0.0…GC-1.12 records
+│  ├─ local-guard.md             # cooperative local lock + foreign-change baseline/sweep
 │  ├─ cycle-end.md               # receipt-first cycle-end event and recovery contract
 │  ├─ receipt-protocol.md        # verification/v2 receipts, hashing, review, retry rules
 │  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
@@ -68,9 +69,11 @@ gatecraft/                       # the installable unit — copy this whole fold
 │  └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
 ├─ scripts/
 │  ├─ Gatecraft.Protocol.psm1    # deterministic parser, validator, hasher, sanitizer, retry state
+│  ├─ guard.ps1 / guard.sh       # PowerShell 7 + POSIX/Git-Bash local guard entry points
 │  ├─ cycle-end.ps1              # PowerShell 7 receipt-first cycle-end entry point
 │  └─ cycle-end.sh               # POSIX/Git-Bash argument-preserving entry point
 └─ tests/
+   ├─ Test-Guard.ps1             # concurrency, foreign-change, process, path, shell-parity gate
    ├─ Test-CycleEnd.ps1          # idempotency, conflict, kill/replay, and shell-parity gate
    ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
    └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
@@ -97,6 +100,7 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 - a git repository
 - at least one installed CLI coding agent
 - a real shell (Claude Code CLI or its VS Code extension, or an equivalent shell-capable environment)
+- PowerShell 7 (`pwsh`) and Git; on Windows shell-parity testing uses Git for Windows Bash
 
 `bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything.
 
@@ -105,6 +109,7 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 Before committing any change to the skill or its references, maintainers must run all dependency-free protocol gates from the repository root:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
@@ -140,7 +145,7 @@ Se affidi un backlog a uno sciame di agenti, il modo di fallire è sempre lo ste
 | 🎯 **Gate prima del dispatch** | Una definizione di "fatto" concreta e meccanica (test esistente → script mirato → check runtime reale) è scritta *prima* che il worker parta — mai una descrizione a parole. |
 | 🧬 **Isola, poi riconcilia** | Ogni bead ha il suo worktree; prima del merge, main viene reintegrato e il gate rigira sul risultato combinato *e* su main stesso. |
 | 🔍 **Review ≠ gate** | Gate comportamentale e review di sicurezza/design sono distinti; i path sensibili (auth, pagamenti, segreti, dati personali) ricevono sempre un reviewer avversariale da un profilo *diverso*. |
-| 🤝 **Handoff come reggenza temporanea** | All'esaurimento del rate-limit il ruolo di orchestratore passa con uno snapshot durevole e viene riottenuto dopo — con lock best-effort, regole di heartbeat/staleness e finestre di ACK per evitare due orchestratori attivi insieme. |
+| 🤝 **Handoff come reggenza temporanea** | All'esaurimento del rate-limit il ruolo passa con uno snapshot durevole — usando un guard cooperativo locale sul Git common-dir, il lock durevole best-effort, heartbeat/staleness e finestre di ACK. |
 | 🌙 **Operatività unattended sicura** | Il silenzio non è mai autorizzazione. Le policy decise al bootstrap (successione, esaurimento worker, tetto unattended, push/deploy) risolvono solo ciò che l'utente ha esplicitamente delegato. |
 
 ### Compatibilità della sedia dell'orchestratore
@@ -156,6 +161,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 ├─ SKILL.md                      # protocollo core, invarianti inline, routing al contratto
 ├─ references/
 │  ├─ execution-contract.md      # record normativi GC-0.0…GC-1.12
+│  ├─ local-guard.md             # lock locale cooperativo + baseline/sweep delle modifiche estranee
 │  ├─ cycle-end.md               # evento cycle-end receipt-first e contratto di ripristino
 │  ├─ receipt-protocol.md        # ricevute verification/v2, hash, review e retry
 │  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
@@ -168,9 +174,11 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 │  └─ wordpress.md               # checklist WordPress + incidente sandbox Windows
 ├─ scripts/
 │  ├─ Gatecraft.Protocol.psm1    # parser, validatore, hash, sanitizzazione e retry deterministici
+│  ├─ guard.ps1 / guard.sh       # entry point PowerShell 7 + POSIX/Git-Bash del guard locale
 │  ├─ cycle-end.ps1              # entry point receipt-first per PowerShell 7
 │  └─ cycle-end.sh               # entry point POSIX/Git-Bash che preserva gli argomenti
 └─ tests/
+   ├─ Test-Guard.ps1             # gate concorrenza, modifiche estranee, processi, path e parità shell
    ├─ Test-CycleEnd.ps1          # gate idempotenza, conflitti, kill/replay e parità shell
    ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
    └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
@@ -197,6 +205,7 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 - un repository git
 - almeno un CLI coding agent installato
 - una shell reale (Claude Code CLI o la sua estensione VS Code, o un ambiente equivalente con shell)
+- PowerShell 7 (`pwsh`) e Git; su Windows il test di parità usa Bash di Git for Windows
 
 `bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa.
 
@@ -205,6 +214,7 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire tutti i gate del protocollo senza dipendenze dalla root del repository:
 
 ```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1

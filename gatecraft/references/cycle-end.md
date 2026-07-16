@@ -1,6 +1,6 @@
 # Cycle-end event (`gatecraft-cycle/v1`)
 
-`cycle-end` is the only event in the MVP. Invoke it once at GC-1.12 after the verification ledger and bead status are current. The caller supplies sanitized, stable values; the command does not read a raw worker log, tracker, repository, clock, or network.
+`cycle-end` is the only event in the MVP. Invoke it once at GC-1.12 after the verification ledger and bead status are current and after the separate `local-guard.md` sweep of GC-1.10's fresh verified-postmerge baseline exits zero. The caller supplies sanitized, stable values; the command does not read a raw worker log, tracker, repository, clock, or network. The sweep is an explicit preceding call, not a new cycle event or ledger input.
 
 ## Entry points
 
@@ -72,6 +72,8 @@ Only exit 0 plus `CYCLE_END_COMPLETE ... projections=complete` means automatic c
 In `unattended` mode projection failure always fails closed and prints no manual fallback. In `attended` mode it is still nonzero and explicitly reports `automatic_completion=false`, followed by this checklist: resolve the local projection write problem without editing the receipt; rerun the exact same event; require a zero exit with `projections=complete`. The checklist is a visible recovery route, never success.
 
 Do not claim the next bead until the exact event has completed. An attended operator who cannot repair automatically may manually reconstruct the four projections only from the canonical receipts, must record that the automatic command remains incomplete, and must not emit the automatic completion marker.
+
+Keep the cooperative local guard through this command. If this is a terminal/local boundary and no more local orchestration mutation is pending, only the exact owner may call `guard.ps1 release` (or `guard.sh release`) afterward. A continuing owner may retain it for the next bead. Cycle-end never acquires, releases, reads, or becomes authoritative over that guard.
 
 ## Deterministic test controls
 
