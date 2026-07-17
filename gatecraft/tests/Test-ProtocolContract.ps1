@@ -443,6 +443,10 @@ Assert-Match -Text $contract -Pattern 'exactly-one sanitized `USAGE_CHECK` recor
 Assert-Match -Text $localGuardReference -Pattern 'GUARD_IDENTITY status=unavailable reason=owner-binding-unprovable' -Message 'Local guard must expose a stable sanitized headless identity outcome.'
 Assert-Match -Text $localGuardReference -Pattern 'must not invoke `acquire` or `release` with a shell, launcher, worker, inherited, guessed, or recycled PID' -Message 'Headless guard handling must forbid substitute PID bindings.'
 Assert-Match -Text $contract -Pattern 'A headless limitation never authorizes a substitute PID, guard bypass, release, or steal' -Message 'Execution contract must fail closed for unverifiable headless guard identity.'
+Assert-Match -Text $skill -Pattern 'Never copy, symlink, or read a real `\.env`' -Message 'Parallel resource policy must forbid real environment file reuse.'
+Assert-Match -Text $skill -Pattern 'At most one worker may run migrations or a reset against any namespace' -Message 'Parallel resource policy must serialize mutable database writers.'
+Assert-Match -Text $dispatch -Pattern 'orchestrator-provisioned isolated test credential/namespace' -Message 'Dispatch template must require isolated test database resources.'
+Assert-Match -Text $contract -Pattern 'authorized migration/reset writer' -Message 'Execution contract must record migration ownership.'
 
 $powerShellBlocks = [regex]::Matches($quota, '(?ms)^~~~powershell\r?\n(?<code>.*?)^~~~\s*$')
 Assert-True -Condition ($powerShellBlocks.Count -ge 3) -Message "Quota reference must contain copyable PowerShell helper, Claude, and Codex blocks; found $($powerShellBlocks.Count)."

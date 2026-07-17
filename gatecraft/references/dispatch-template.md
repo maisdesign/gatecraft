@@ -21,6 +21,7 @@ Tool invocation pattern for this project (from Step 0.3): <exact path/flags, e.g
 
 Constraints:
 - Do not read or output the contents of .env, credentials, API keys, or any secret/credential file.
+- Do not copy, symlink, or reuse a real `.env` in this worktree. For database tests use only an orchestrator-provisioned isolated test credential/namespace; do not run schema reset, migration deploy, or destructive database commands against a shared or unknown database.
 - If you repoint any shared-runtime indirection (symlink/mount/dev-env link) to test this, restore it
   to its original target before reporting done — this is part of done, not optional cleanup.
 - Stay inside this worktree; do not push, merge, or touch other worktrees/branches.

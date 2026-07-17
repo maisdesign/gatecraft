@@ -147,8 +147,8 @@ Classify every other variation as a capability or a policy, never as another mod
 ### GC-1.2 — Overlap control
 
 - **Trigger:** Prepare any serial or parallel dispatch after selecting a bead.
-- **Action:** Check file, transitive dependency, and shared mutable resource overlap; isolate each shared resource or serialize; cap concurrency at monitorable and independently verifiable capacity.
-- **Evidence:** Record the three overlap decisions, resource namespaces, dependency result, serialization choice, and concurrency cap.
+- **Action:** Check file, transitive dependency, and shared mutable resource overlap; isolate each shared resource or serialize. For Prisma or another mutable database, require an explicit isolated test namespace/credential source per worker, name the only authorized migration/reset writer, and prohibit real `.env` copying, symlinking, or reading; cap concurrency at monitorable and independently verifiable capacity.
+- **Evidence:** Record the three overlap decisions, database namespace/credential-source identifiers without values, authorized migration/reset writer, dependency result, serialization choice, and concurrency cap.
 - **Stop:** Stop parallel dispatch when any overlap remains unresolved or independent monitoring and verification capacity is insufficient.
 
 ### GC-1.3 — Isolated worktree
