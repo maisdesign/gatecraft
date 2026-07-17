@@ -1170,6 +1170,102 @@ function Resolve-GatecraftRetrySequence {
     }
 }
 
+function ConvertTo-GatecraftSanitizedFeedEvent {
+    <#
+    .SYNOPSIS
+        Converts a VERIFIED/VERIFY_PHASE receipt line into the minimal sanitized fields
+        needed to publish one gatecraft-debategui/v1 feed event via registry.ps1 publish-event.
+
+    .DESCRIPTION
+        Implements the evidence-hygiene "minimize by construction" boundary control
+        (see gatecraft/references/evidence-hygiene.md): the sanitized event is built
+        ONLY from a fixed allowlist of already-schema-validated scalar receipt fields
+        (receipt_id, phase, gate, exit, result, verified_at). Free-text/quoted fields
+        such as "evidence" are never read and never cross into the sanitized event.
+        Every incorporated field is re-validated against the strict unquoted receipt
+        token grammar regardless of how it was originally written, so a maliciously or
+        carelessly quoted value cannot smuggle raw content through. Protect-GatecraftText
+        is still applied as a final defensive pass for any caller-supplied known secret.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Line,
+        [hashtable] $KnownSecret = @{},
+        [AllowNull()] $CycleSequence = $null
+    )
+
+    $tokenPattern = '^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$'
+    # Gate is often a quoted command line (e.g. "pwsh -NoProfile -File gate.ps1"), so it
+    # uses the broader sanitized-fragment allowlist instead of the single-token pattern.
+    # This is the exact charset registry.ps1's Assert-SanitizedEventText accepts for a
+    # feed summary, so a gate value that passes here will also pass at publish time.
+    $fragmentPattern = '^[A-Za-z0-9][A-Za-z0-9 ._:/+=-]{0,127}$'
+    $parsed = ConvertFrom-GatecraftReceiptLine -Line $Line -KnownSecret $KnownSecret
+
+    if (-not $parsed.IsValid -or $parsed.Type -cnotin @('VERIFIED', 'VERIFY_PHASE')) {
+        return [pscustomobject][ordered]@{
+            IsApplicable = $false
+            Reason = 'event.not-applicable'
+            EventType = $null; Outcome = $null; OccurredAt = $null; Summary = $null; EventId = $null; CycleSequence = $null
+        }
+    }
+
+    $receiptId = Get-GatecraftField -Receipt $parsed -Name 'receipt_id'
+    $phase = Get-GatecraftField -Receipt $parsed -Name 'phase'
+    $gate = Get-GatecraftField -Receipt $parsed -Name 'gate'
+    $exit = Get-GatecraftField -Receipt $parsed -Name 'exit'
+    $result = Get-GatecraftField -Receipt $parsed -Name 'result'
+    $verifiedAt = Get-GatecraftField -Receipt $parsed -Name 'verified_at'
+
+    foreach ($candidate in @($receiptId, $phase, $exit, $result)) {
+        if ($null -eq $candidate -or $candidate -cnotmatch $tokenPattern) {
+            return [pscustomobject][ordered]@{
+                IsApplicable = $false
+                Reason = 'event.unsafe-field'
+                EventType = $null; Outcome = $null; OccurredAt = $null; Summary = $null; EventId = $null; CycleSequence = $null
+            }
+        }
+    }
+    if ($null -eq $gate -or $gate -cnotmatch $fragmentPattern -or $gate.Contains('..', [StringComparison]::Ordinal) -or $gate.Contains('://', [StringComparison]::Ordinal) -or $gate -match '(?i)[a-z]:[\\/]') {
+        return [pscustomobject][ordered]@{
+            IsApplicable = $false
+            Reason = 'event.unsafe-field'
+            EventType = $null; Outcome = $null; OccurredAt = $null; Summary = $null; EventId = $null; CycleSequence = $null
+        }
+    }
+    if ($result -cnotin @('pass', 'fail')) {
+        return [pscustomobject][ordered]@{
+            IsApplicable = $false
+            Reason = 'event.result-unknown'
+            EventType = $null; Outcome = $null; OccurredAt = $null; Summary = $null; EventId = $null; CycleSequence = $null
+        }
+    }
+    if (-not (Test-GatecraftIso8601 -Value $verifiedAt)) {
+        return [pscustomobject][ordered]@{
+            IsApplicable = $false
+            Reason = 'event.timestamp-invalid'
+            EventType = $null; Outcome = $null; OccurredAt = $null; Summary = $null; EventId = $null; CycleSequence = $null
+        }
+    }
+
+    $eventType = if ($parsed.Type -ceq 'VERIFIED') { 'verification' } else { 'verify-phase' }
+    $outcome = if ($result -ceq 'pass') { 'verified' } else { 'verification-failed' }
+    $summary = Protect-GatecraftText -Text "receipt=$receiptId phase=$phase gate=$gate exit=$exit result=$result" -KnownSecret $KnownSecret
+    $eventIdSeed = [Text.UTF8Encoding]::new($false).GetBytes("$($parsed.Type)|$receiptId")
+    $eventId = 'receipt-' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($eventIdSeed)).ToLowerInvariant().Substring(0, 32)
+
+    return [pscustomobject][ordered]@{
+        IsApplicable = $true
+        Reason = 'event.applicable'
+        EventType = $eventType
+        Outcome = $outcome
+        OccurredAt = $verifiedAt
+        Summary = $summary
+        EventId = $eventId
+        CycleSequence = $CycleSequence
+    }
+}
+
 Export-ModuleMember -Function @(
     'Protect-GatecraftText',
     'ConvertFrom-GatecraftReceiptLine',
@@ -1178,5 +1274,6 @@ Export-ModuleMember -Function @(
     'Test-GatecraftVerificationChain',
     'ConvertTo-GatecraftDashboardProjection',
     'Get-GatecraftAggregateFingerprint',
-    'Resolve-GatecraftRetrySequence'
+    'Resolve-GatecraftRetrySequence',
+    'ConvertTo-GatecraftSanitizedFeedEvent'
 )

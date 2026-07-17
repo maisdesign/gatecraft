@@ -16,6 +16,10 @@ Test-only interruption controls:
   --failpoint-action <exit|pause>
   --fail-projection <session-log|heartbeat|snapshot|dashboard>
   Require GATECRAFT_CYCLE_END_TEST_CONTROLS=1 whenever any test control is supplied.
+
+Optional automatic DebateGUI feed publication (see gatecraft/references/debategui-integration.md):
+  --publish-local-state-root <absolute-path> --publish-instance-id <id> --publish-owner-token <opaque-token>
+  All three or none. A publication failure never fails cycle-end; it is best-effort only.
 '@)
 }
 
@@ -42,7 +46,8 @@ function Read-ExactArguments {
     foreach ($name in @(
         '--state-root', '--event-id', '--cycle-sequence', '--mode',
         '--occurred-at', '--outcome', '--summary', '--failpoint',
-        '--failpoint-action', '--fail-projection'
+        '--failpoint-action', '--fail-projection',
+        '--publish-local-state-root', '--publish-instance-id', '--publish-owner-token'
     )) {
         [void] $allowed.Add($name)
     }
@@ -431,6 +436,75 @@ function Invoke-WriteBoundaryFailpoint {
     }
 }
 
+function Invoke-BestEffortCycleEndPublish {
+    <#
+    .SYNOPSIS
+        Best-effort automatic publication of one sanitized gatecraft-debategui/v1 feed
+        event for this cycle-end completion. See gatecraft/references/debategui-integration.md:
+        "Gatecraft remains fully functional when DebateGUI is absent... A UI failure is
+        never a Gatecraft failure." This function therefore NEVER throws and NEVER
+        changes cycle-end's exit code; every failure path is a stderr warning only.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $LocalStateRoot,
+        [Parameter(Mandatory)][string] $InstanceId,
+        [Parameter(Mandatory)][string] $OwnerToken,
+        [Parameter(Mandatory)][string] $EventId,
+        [Parameter(Mandatory)][long] $Sequence,
+        [Parameter(Mandatory)][string] $OccurredAt,
+        [Parameter(Mandatory)][string] $Outcome,
+        [Parameter(Mandatory)][string] $Summary
+    )
+
+    try {
+        $registryScript = Join-Path $PSScriptRoot 'registry.ps1'
+        $publishArguments = [Collections.Generic.List[string]]::new()
+        $publishArguments.AddRange([string[]]@(
+            'publish-event',
+            '--local-state-root', $LocalStateRoot,
+            '--instance-id', $InstanceId,
+            '--owner-token', $OwnerToken,
+            '--event-type', 'cycle-end',
+            '--occurred-at', $OccurredAt,
+            '--outcome', $Outcome,
+            '--summary', $Summary,
+            '--event-id', "cycle-$EventId",
+            '--cycle-sequence', ([string] $Sequence)
+        ))
+
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'pwsh'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.ArgumentList.Add('-NoLogo')
+        $startInfo.ArgumentList.Add('-NoProfile')
+        $startInfo.ArgumentList.Add('-File')
+        $startInfo.ArgumentList.Add($registryScript)
+        foreach ($argument in $publishArguments) { $startInfo.ArgumentList.Add($argument) }
+        $child = [Diagnostics.Process]::new()
+        $child.StartInfo = $startInfo
+        [void] $child.Start()
+        $stderrTask = $child.StandardError.ReadToEndAsync()
+        [void] $child.StandardOutput.ReadToEndAsync()
+        if (-not $child.WaitForExit(30000)) {
+            try { $child.Kill($true) } catch { }
+            [Console]::Error.WriteLine('CYCLE_END_PUBLISH_WARNING code=registry-publish-timeout')
+        }
+        elseif ($child.ExitCode -ne 0) {
+            [Console]::Error.WriteLine("CYCLE_END_PUBLISH_WARNING code=registry-publish-failed exit=$($child.ExitCode) detail=$($stderrTask.GetAwaiter().GetResult())")
+        }
+        else {
+            [Console]::Out.WriteLine('CYCLE_END_PUBLISHED code=event-published')
+        }
+        $child.Dispose()
+    }
+    catch {
+        [Console]::Error.WriteLine('CYCLE_END_PUBLISH_WARNING code=registry-publish-unavailable')
+    }
+}
+
 function Write-ProjectionFailure {
     param(
         [Parameter(Mandatory)][string] $Mode,
@@ -516,6 +590,13 @@ try {
         throw 'fail-projection-invalid: reject an unknown projection.'
     }
 
+    $publishKeys = @('--publish-local-state-root', '--publish-instance-id', '--publish-owner-token')
+    $publishPresent = @($publishKeys | Where-Object { $options.ContainsKey($_) })
+    if ($publishPresent.Count -gt 0 -and $publishPresent.Count -ne $publishKeys.Count) {
+        throw 'publish-arguments-incomplete: require all of --publish-local-state-root, --publish-instance-id, and --publish-owner-token together, or none.'
+    }
+    $publishEnabled = $publishPresent.Count -eq $publishKeys.Count
+
     $stateRoot = Initialize-StateRoot -DeclaredPath $options['--state-root']
     $cycleRoot = [IO.Path]::Combine($stateRoot, 'cycle-end')
     $receiptDirectory = [IO.Path]::Combine($cycleRoot, 'receipts')
@@ -590,6 +671,10 @@ try {
     catch {
         Write-ProjectionFailure -Mode $mode -EventId $eventId -Sequence $sequence -Message $_.Exception.Message
         exit 74
+    }
+
+    if ($publishEnabled) {
+        Invoke-BestEffortCycleEndPublish -LocalStateRoot $options['--publish-local-state-root'] -InstanceId $options['--publish-instance-id'] -OwnerToken $options['--publish-owner-token'] -EventId $eventId -Sequence $sequence -OccurredAt $occurredAt -Outcome $outcome -Summary $summary
     }
 
     [Console]::Out.WriteLine("CYCLE_END_COMPLETE event_id=$eventId sequence=$sequence receipt=$receiptDisposition projections=complete")
