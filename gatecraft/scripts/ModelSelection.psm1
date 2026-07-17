@@ -6,7 +6,7 @@ function Resolve-GatecraftModelSelection {
         [Parameter(Mandatory)][object[]] $Models,
         [Parameter(Mandatory)][ValidateSet('implementer', 'reviewer', 'sensitive-reviewer')][string] $Role,
         [Parameter(Mandatory)][ValidateSet('low', 'medium', 'high')][string] $Thinking,
-        [Parameter(Mandatory)][string[]] $AvailableModelIds,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]] $AvailableModelIds,
         [string] $OverrideModelId
     )
 
@@ -17,7 +17,9 @@ function Resolve-GatecraftModelSelection {
         $modelId = $properties['id'].Value
         $qualityTier = $properties['quality_tier'].Value
         $deprecationState = $properties['deprecation_state'].Value
-        if ($modelId -isnot [string] -or $qualityTier -isnot [string] -or $deprecationState -isnot [string]) { return $false }
+        $costTier = $properties['cost_tier'].Value
+        $isNumericCostTier = $costTier -is [sbyte] -or $costTier -is [byte] -or $costTier -is [int16] -or $costTier -is [uint16] -or $costTier -is [int32] -or $costTier -is [uint32] -or $costTier -is [int64] -or $costTier -is [uint64] -or $costTier -is [single] -or $costTier -is [double] -or $costTier -is [decimal]
+        if ([string]::IsNullOrEmpty($modelId) -or $qualityTier -isnot [string] -or $deprecationState -isnot [string] -or -not $isNumericCostTier -or -not [double]::IsFinite([double]$costTier) -or [double]$costTier -lt 0 -or $qualityTier -cnotin @('standard', 'high')) { return $false }
         @($AvailableModelIds | Where-Object { [String]::Equals($_, $modelId, [StringComparison]::Ordinal) }).Count -gt 0 -and
         $_.roles -ccontains $Role -and
         $_.thinking_levels -ccontains $Thinking -and
@@ -47,7 +49,10 @@ function Test-GatecraftEffectiveModelSelection {
     $properties = $Selection.PSObject.Properties
     if (-not ($properties['Decision'] -and $properties['ModelId'] -and $properties['Thinking'])) { return [pscustomobject]@{ Decision = 'block'; ReasonCode = 'selection-unavailable' } }
     if ($Selection.Decision -cne 'select') { return [pscustomobject]@{ Decision = 'block'; ReasonCode = 'selection-unavailable' } }
-    if (-not [String]::Equals($ReportedModel, $Selection.ModelId, [StringComparison]::Ordinal) -or -not [String]::Equals($ReportedThinking, $Selection.Thinking, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Decision = 'block'; ReasonCode = 'launch-setting-drift' } }
+    $expectedModel = $properties['ModelId'].Value
+    $expectedThinking = $properties['Thinking'].Value
+    if ($expectedModel -isnot [string] -or [string]::IsNullOrEmpty($expectedModel) -or $expectedThinking -isnot [string] -or $expectedThinking -cnotin @('low', 'medium', 'high')) { return [pscustomobject]@{ Decision = 'block'; ReasonCode = 'selection-unavailable' } }
+    if (-not [String]::Equals($ReportedModel, $expectedModel, [StringComparison]::Ordinal) -or -not [String]::Equals($ReportedThinking, $expectedThinking, [StringComparison]::Ordinal)) { return [pscustomobject]@{ Decision = 'block'; ReasonCode = 'launch-setting-drift' } }
     return [pscustomobject]@{ Decision = 'accept'; ReasonCode = 'effective-settings-match' }
 }
 
