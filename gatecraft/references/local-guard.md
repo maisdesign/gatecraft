@@ -57,6 +57,10 @@ The holder is installed directly with an exclusive `CreateNew` open. Its determi
 
 The PID must be positive and the supplied PID/start pair must match the actual live local process before and after acquisition. A contender never opens the existing file for write. An existing valid dead or start-mismatched holder reports `lock-stale-attended-recovery-required` and remains untouched; there is no automatic steal or stale recovery. Empty, partial, noncanonical, unknown-field, reparse, or unexpected-entry state fails closed.
 
+## Headless identity boundary
+
+If a headless harness cannot prove the long-lived orchestrator's exact live PID and canonical start binding, it must not invoke `acquire` or `release` with a shell, launcher, worker, inherited, guessed, or recycled PID. Persist only the sanitized local evidence `GUARD_IDENTITY status=unavailable reason=owner-binding-unprovable`, then stop before any claim, dispatch, tracker mutation, merge, close, release, or guard recovery. It must not delete or alter `holder.json`, retry against a substitute process, bypass the guard, or steal an existing holder. Resume only when the same orchestrator can supply a freshly proven live PID/start pair, or when an attended human performs the documented recovery; a harness limitation is never stale-holder evidence.
+
 Release opens and strictly validates the persisted record again, compares all three owner fields exactly, re-proves that the persisted PID/start is live, rechecks the fixed directory, and deletes only `holder.json`. A wrong token, PID, or start reports `lock-owner-mismatch` and leaves the holder byte-identical. The empty fixed guard directory is retained.
 
 ## Foreign-change baseline and sweep

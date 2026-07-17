@@ -49,7 +49,7 @@ Classify every other variation as a capability or a policy, never as another mod
 - **Trigger:** Begin Step 0 after the exact owner has acquired the non-conflicting cooperative local guard and before running any bootstrap check or installation action.
 - **Action:** Create an append-only local session log using the project convention or log/orchestration-<ISO-date>.md, restrict access to the current user and explicitly authorized local operators, keep the raw log out of git without silently editing the user's tracked .gitignore by preferring a user-approved project .gitignore rule, otherwise using local .git/info/exclude when available or placing the raw directory outside the repository, preserve all existing user work, and apply evidence-hygiene.md before copying any content elsewhere.
 - **Evidence:** Record the sanitized local-guard success marker/reason, log path, creation time, restrictive-access check, retention policy, selected ignore mechanism and any user approval, and first bootstrap entry without recording secrets.
-- **Stop:** Stop before GC-0.1 when local guard acquisition is nonzero or the local log cannot be created, appended, access-restricted, or kept outside tracked/shared/public evidence.
+- **Stop:** Stop before GC-0.1 when local guard acquisition is nonzero, the harness cannot prove the long-lived orchestrator PID/start binding (`GUARD_IDENTITY status=unavailable reason=owner-binding-unprovable`), or the local log cannot be created, appended, access-restricted, or kept outside tracked/shared/public evidence. A headless limitation never authorizes a substitute PID, guard bypass, release, or steal.
 
 ### GC-0.1 — Beads
 

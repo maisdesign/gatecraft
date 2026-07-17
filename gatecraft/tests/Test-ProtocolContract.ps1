@@ -440,6 +440,9 @@ Assert-Match -Text $quota -Pattern 'Do not retry in that cycle and do not synthe
 Assert-Match -Text $handoff -Pattern 'USAGE_CHECK cycle=<completed-cycle-id>' -Message 'Handoff protocol must define a machine-greppable per-cycle usage record.'
 Assert-Match -Text $handoff -Pattern 'A no-data or skip record preserves unattended continuity, but its absence blocks the next bead claim' -Message 'Usage evidence must block only when absent, not when no-data is explicit.'
 Assert-Match -Text $contract -Pattern 'exactly-one sanitized `USAGE_CHECK` record is durable' -Message 'Execution contract must require usage evidence before the next claim.'
+Assert-Match -Text $localGuardReference -Pattern 'GUARD_IDENTITY status=unavailable reason=owner-binding-unprovable' -Message 'Local guard must expose a stable sanitized headless identity outcome.'
+Assert-Match -Text $localGuardReference -Pattern 'must not invoke `acquire` or `release` with a shell, launcher, worker, inherited, guessed, or recycled PID' -Message 'Headless guard handling must forbid substitute PID bindings.'
+Assert-Match -Text $contract -Pattern 'A headless limitation never authorizes a substitute PID, guard bypass, release, or steal' -Message 'Execution contract must fail closed for unverifiable headless guard identity.'
 
 $powerShellBlocks = [regex]::Matches($quota, '(?ms)^~~~powershell\r?\n(?<code>.*?)^~~~\s*$')
 Assert-True -Condition ($powerShellBlocks.Count -ge 3) -Message "Quota reference must contain copyable PowerShell helper, Claude, and Codex blocks; found $($powerShellBlocks.Count)."
