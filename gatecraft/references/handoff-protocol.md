@@ -39,6 +39,14 @@ Running to the limit is then acceptable: the scheduled successor picks up from t
 
 Check after each complete bead cycle and before claiming another; do not poll on a timer.
 
+Before the next claim, persist exactly one sanitized, machine-greppable record in the durable session log and current handoff snapshot:
+
+```
+USAGE_CHECK cycle=<completed-cycle-id> adapter=<claude-usage|codex-rate-limits|none> status=<ok|no-data|skip> short_session=<0-100|unavailable> weekly=<0-100|unavailable> reason=<sanitized-reason-code> checked_at=<UTC-RFC3339>
+```
+
+`status=skip` is allowed only when no applicable adapter was discovered or the persisted policy disables it; state that sanitized reason. `status=no-data` is the required result for an attempted adapter without a trustworthy short-session value. Never omit the line, infer a percentage, include raw provider output, or run another adapter in the same cycle to replace it. A no-data or skip record preserves unattended continuity, but its absence blocks the next bead claim.
+
 ## The two tiers
 
 The two tiers below apply only when a trustworthy short-session value is available. They never apply to weekly usage: a weekly-only reading remains valid while the short-session capability is unavailable, and it must not trigger either tier.

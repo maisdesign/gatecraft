@@ -95,6 +95,7 @@ $receiptTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-ReceiptProtocol.ps1
 $recoveryTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-RecoveryProtocol.ps1'
 $skillPath = Join-Path $repoRoot 'gatecraft/SKILL.md'
 $dispatchPath = Join-Path $repoRoot 'gatecraft/references/dispatch-template.md'
+$handoffPath = Join-Path $repoRoot 'gatecraft/references/handoff-protocol.md'
 $quotaPath = Join-Path $repoRoot 'gatecraft/references/codex-quota.md'
 $changelogPath = Join-Path $repoRoot 'gatecraft/references/changelog.md'
 $readmePath = Join-Path $repoRoot 'README.md'
@@ -113,6 +114,7 @@ $cycleEndScript = Read-RequiredText -Path $cycleEndScriptPath -Label 'Cycle-end 
 $cycleEndShell = Read-RequiredText -Path $cycleEndShellPath -Label 'Cycle-end POSIX entry point'
 $cycleEndTest = Read-RequiredText -Path $cycleEndTestPath -Label 'Cycle-end behavioral gate'
 $guardTest = Read-RequiredText -Path $guardTestPath -Label 'Guard behavioral gate'
+$handoff = Read-RequiredText -Path $handoffPath -Label 'Handoff protocol reference'
 $receiptTest = Read-RequiredText -Path $receiptTestPath -Label 'Receipt protocol behavioral gate'
 $recoveryTest = Read-RequiredText -Path $recoveryTestPath -Label 'Recovery protocol behavioral gate'
 $skill = Read-RequiredText -Path $skillPath -Label 'Gatecraft core skill'
@@ -435,6 +437,9 @@ Assert-Match -Text $quota -Pattern "status\s*=\s*'no-data'" -Message 'Quota adap
 Assert-Match -Text $quota -Pattern 'usedPercent\s*=\s*\$null' -Message 'Quota adapters must represent missing percentages as null.'
 Assert-Match -Text $quota -Pattern 'Never convert a missing or transient response into 0%' -Message 'Quota guidance must explicitly forbid converting missing/transient data to zero.'
 Assert-Match -Text $quota -Pattern 'Do not retry in that cycle and do not synthesize a zero' -Message 'Codex transient responses must remain no-data for the cycle.'
+Assert-Match -Text $handoff -Pattern 'USAGE_CHECK cycle=<completed-cycle-id>' -Message 'Handoff protocol must define a machine-greppable per-cycle usage record.'
+Assert-Match -Text $handoff -Pattern 'A no-data or skip record preserves unattended continuity, but its absence blocks the next bead claim' -Message 'Usage evidence must block only when absent, not when no-data is explicit.'
+Assert-Match -Text $contract -Pattern 'exactly-one sanitized `USAGE_CHECK` record is durable' -Message 'Execution contract must require usage evidence before the next claim.'
 
 $powerShellBlocks = [regex]::Matches($quota, '(?ms)^~~~powershell\r?\n(?<code>.*?)^~~~\s*$')
 Assert-True -Condition ($powerShellBlocks.Count -ge 3) -Message "Quota reference must contain copyable PowerShell helper, Claude, and Codex blocks; found $($powerShellBlocks.Count)."
