@@ -4,7 +4,7 @@ This contract selects explicit worker and reviewer launch settings; it never cha
 
 ## Local record
 
-Persist a canonical UTF-8-without-BOM JSON record outside the repository at `<local-state>/model-catalog-v1/catalog.json`. It contains only `protocol`, `generated_at`, `source`, and a sorted `models` array. Every model has a stable `id`, `provider`, `roles`, `thinking_levels`, `cost_tier`, and `quality_tier`. Reject unknown fields, duplicate IDs, unsupported thinking levels, missing provenance, non-UTC timestamps, and credentials, prompts, tokens, PIDs, or raw provider responses.
+Persist a canonical UTF-8-without-BOM JSON record outside the repository at `<local-state>/model-catalog-v1/catalog.json`. It contains only `protocol`, `generated_at`, `source`, and a sorted `models` array. Every model has a stable `id`, `provider`, `roles`, `thinking_levels`, `cost_tier`, `quality_tier`, and `deprecation_state`. Reject unknown fields, duplicate IDs, unsupported thinking levels, missing provenance, non-UTC timestamps, and credentials, prompts, tokens, PIDs, or raw provider responses.
 
 `source` is one explicit trusted local capability probe or a user-approved static catalog. Network data is never trusted directly: a refresh command must sanitize and validate it before replacing the local record.
 
@@ -25,5 +25,7 @@ Per-launch availability is separate from catalog freshness. Before a launch, ver
 ## Selection and evidence
 
 The orchestrator chooses worker/reviewer settings, not the human's own orchestrator settings. It must record only sanitized fields: catalog protocol/version, freshness state, source kind, selected model ID, selected thinking level, role, decision reason codes, and availability outcome. Retain the local catalog under the normal restricted local-state policy; never commit it or publish raw provider data.
+
+For an active, available model with the requested supported thinking level, select the lowest `cost_tier` for `implementer` and ordinary `reviewer`; break ties by higher `quality_tier`, then ordinal model ID. `sensitive-reviewer` filters to `quality_tier=high` before applying the same tie-break. Construct the launch with explicit `--model <id>` and `--config model_reasoning_effort="<level>"`; accept it only when the launched session reports the same effective model and thinking level. A mismatch is `launch-setting-drift`, never an implicit retry with defaults.
 
 The human may opt in to a source, a refresh authority, or an explicit one-off fallback. Silence, stale data, network availability, or a provider error is never opt-in.

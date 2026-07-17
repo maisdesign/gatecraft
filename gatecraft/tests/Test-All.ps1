@@ -9,7 +9,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     exit 1
 }
 
-$tests = @('Test-RecoveryProtocol.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1', 'Test-ModelCatalog.ps1', 'Test-CycleEnd.ps1', 'Test-Guard.ps1')
+$tests = @('Test-RecoveryProtocol.ps1', 'Test-ReceiptProtocol.ps1', 'Test-ProtocolContract.ps1', 'Test-ModelCatalog.ps1', 'Test-ModelSelection.ps1', 'Test-CycleEnd.ps1', 'Test-Guard.ps1')
 foreach ($test in $tests) {
     & pwsh -NoLogo -NoProfile -File (Join-Path $PSScriptRoot $test)
     if ($LASTEXITCODE -ne 0) {
