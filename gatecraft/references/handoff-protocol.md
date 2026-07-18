@@ -1,6 +1,6 @@
 # Handoff, lock, and verification-ledger mechanics (Step 3 detail)
 
-`SKILL.md` Step 3 states the **invariants** — when to hand off, that the lock is best-effort not mutual exclusion, that ACK is the successor acquiring the lock, fail-closed on conflict, snapshot persisted and versioned. This file holds the **exact mechanics**: commands, formats, numeric bounds, and field lists you consult while actually performing a handoff. Nothing here overrides an invariant in `SKILL.md`; it operationalizes it.
+`SKILL.md` Step 3 states the **invariants** — when to hand off, that the durable `bd remember` lock is best-effort not mutual exclusion, that ACK is the successor taking that durable lock, fail-closed on conflict, snapshot persisted and versioned. The separate cooperative same-host guard in `local-guard.md` prevents two conforming local processes sharing one Git common directory from reaching that durable protocol concurrently. This file holds the **exact mechanics**: commands, formats, numeric bounds, and field lists you consult while actually performing a handoff. Nothing here overrides an invariant in `SKILL.md`; it operationalizes it.
 
 ## Usage introspection
 
@@ -39,7 +39,17 @@ Running to the limit is then acceptable: the scheduled successor picks up from t
 
 Check after each complete bead cycle and before claiming another; do not poll on a timer.
 
+Before the next claim, persist exactly one sanitized, machine-greppable record in the durable session log and current handoff snapshot:
+
+```
+USAGE_CHECK cycle=<completed-cycle-id> adapter=<claude-usage|codex-rate-limits|none> status=<ok|no-data|skip> short_session=<0-100|unavailable> weekly=<0-100|unavailable> reason=<sanitized-reason-code> checked_at=<UTC-RFC3339>
+```
+
+`status=skip` is allowed only when no applicable adapter was discovered or the persisted policy disables it; state that sanitized reason. `status=no-data` is the required result for an attempted adapter without a trustworthy short-session value. Never omit the line, infer a percentage, include raw provider output, or run another adapter in the same cycle to replace it. A no-data or skip record preserves unattended continuity, but its absence blocks the next bead claim.
+
 ## The two tiers
+
+The two tiers below apply only when a trustworthy short-session value is available. They never apply to weekly usage: a weekly-only reading remains valid while the short-session capability is unavailable, and it must not trigger either tier.
 
 - **Below 95%, but with the next full bead cycle genuinely at risk:** judgment based on estimated bead size, not another fixed percentage. Check 0.6 candidates' headroom with the same introspection, write the snapshot even if none is confirmed, report current usage/reset and candidates with room, and ask whether to hand off or continue.
 - **At or above 95%:** treat this as an overwhelming margin, not a judgment call. Without waiting for a live answer, select the first 0.6 candidate with confirmed headroom, write the snapshot, and hand off. If 0.6 says stop, write the snapshot and stop.
@@ -58,11 +68,13 @@ Each check-in is a watchdog, not an actor with standing authority. Attach a dedu
 
 ## ACK — spawn is not completion
 
-The predecessor stops new dispatches but remains alive and authoritative until the successor acquires the orchestrator lock under its own identity citing the current `handoff_id`; that acquisition alone is ACK. A comment, unrelated `bd` write, or process launch is not proof that authority was assumed. Only after ACK is the handoff complete and the predecessor's authority over. Use the 0.6 ACK window (default **10 minutes**) recorded beside the pending marker so any observer can calculate expiry. If it expires, the spawn failed and the predecessor remains orchestrator: rewrite the pending marker with a fresh `handoff_id` naming the next candidate **before spawning that candidate**, thereby voiding the prior attempt; then try the new candidate or stop cleanly with the snapshot written.
+The predecessor stops new dispatches, writes the pending snapshot/marker while it still owns both locks, and reaches a terminal/local handoff boundary. Only then does that exact owner release the cooperative local guard. The successor must acquire the local guard against the same Git common directory before reading/accepting the pending state; it then acquires the durable orchestrator lock under its own identity citing the current `handoff_id`, and that durable acquisition alone is ACK. A comment, unrelated `bd` write, process launch, or local-guard acquisition is not ACK. Only after ACK is the handoff complete and the predecessor's authority over. Use the 0.6 ACK window (default **10 minutes**) recorded beside the pending marker so any observer can calculate expiry. If it expires, the spawn failed and the predecessor remains the intended orchestrator but may not mutate orchestration state until it reacquires the local guard. After reacquisition it rewrites the pending marker with a fresh `handoff_id` naming the next candidate **before spawning that candidate**, thereby voiding the prior attempt; a conflicting local holder stops the predecessor rather than authorizing takeover.
 
 ## Lock mechanics
 
-**Best-effort conflict detection, not guaranteed mutual exclusion.** Before operating at initial bootstrap or handoff pickup, read the `bd remember` lock identifying holder/profile/session and last confirmation. It is plain, non-atomic read-then-write: it detects conflicts and reduces accidental dual orchestration but cannot mathematically prevent two sessions that both read "free" from acquiring simultaneously. Treat it as conflict evidence, never proof of exclusion. A genuinely atomic OS/file-lock mechanism, if later wired in, would replace this caveat.
+**Two distinct layers.** Before initial bootstrap, acquire `scripts/guard.ps1 acquire` (or `guard.sh`) exactly as `local-guard.md` specifies, before any conforming orchestration mutation. At handoff pickup, acquire it after the predecessor's pending-marker terminal/local release and before reading/accepting the handoff. Its exclusive create is cooperative mutual exclusion only for conforming processes on one host resolving the same local Git common directory; it has no distributed CAS/fencing or cross-host claim.
+
+The `bd remember` lock remains **best-effort durable conflict detection, not guaranteed mutual exclusion**. Read it at initial bootstrap or handoff pickup to identify holder/profile/session and last confirmation. It is plain, non-atomic read-then-write: it carries durable/cross-session succession evidence but cannot mathematically prevent two sessions that both read "free" from acquiring simultaneously, especially across hosts. Treat it as conflict evidence, never proof of exclusion. The local guard complements this durable record; neither replaces the other's scope.
 
 **Heartbeat and staleness — the operational definition of a "live holder."** The holder refreshes the lock's `last confirmation` timestamp at every bead-cycle boundary (claim, merge, close); that write *is* the heartbeat — there is no separate timer thread to rely on. A lock is **stale** only when *both* hold: its `last confirmation` is older than the larger of the declared 0.6 ACK window and one worst-case bead cycle (project-configurable; **default: treat older than 30 minutes as stale**), **and** no live process is holding it. Tie staleness to this field, never to wall-clock alone — a long-running e2e gate is not a dead orchestrator, and declaring a live holder stale is exactly what mints the simultaneous orchestrators listed among 0.5's catastrophic risks. When in doubt between "slow" and "dead," treat it as slow and resolve with the user rather than seizing the lock.
 
@@ -75,6 +87,9 @@ Persist through both `bd remember` and a relevant epic/tracking-bead comment:
 - active worktrees and branch names;
 - the bead tied to each and its status (canonical bead-status vocabulary — defined once in `SKILL.md` Step 1);
 - each in-flight Step 2 gate;
+- each reserved attempt ID, consumed task-attempt count, and total-spawn count;
+- each baseline, integration/premerge, and review receipt ID already emitted for the active artifact;
+- each current foreign-baseline ID and sanitized owned/process counts, without raw status or process data;
 - pending user decisions;
 - `reclaim_at`;
 - intended successor;
@@ -84,13 +99,18 @@ Persist through both `bd remember` and a relevant epic/tracking-bead comment:
 
 A cold successor under any profile loads it through `bd prime`/`bd memories` rather than re-deriving work. The `bd remember` copy is **authoritative**; the comment is a human-readable mirror that never overrides it. `snapshot_seq` is a divergence *detector*, not a conflict *resolver* — because the two writes are not atomic and concurrent writers can mint the same seq or leave a mirror ahead of the authoritative copy, a reader that finds them disagreeing does **not** silently take the higher seq: it treats the disagreement as a real conflict and fail-closes (stop, involve a human), and never auto-takes over across hosts on an ambiguous snapshot.
 
+## Cycle-end call site and fallback
+
+After the GC-1.11 ledger/status update, run the `local-guard.md` read-only sweep of GC-1.10's fresh verified-postmerge baseline, then invoke the single `cycle-end` event described in `cycle-end.md`. Its local canonical receipt is authoritative only for rebuilding the local session-log, heartbeat, snapshot, and dashboard projections; it does **not** replace the foreign baseline, cooperative local guard, `bd remember` handoff snapshot, comment mirror, or durable lock heartbeat/acquisition semantics above. Pass the next event sequence and a stable ID, and replay that exact payload after interruption. Do not claim another bead until the command exits zero with `projections=complete`. If the run is terminating locally, only the exact owner releases the cooperative guard after that boundary; a continuing owner may retain it into the next bead.
+
+If projection cannot complete, unattended mode stops nonzero. Attended mode may print the documented `automatic_completion=false` manual checklist, but that checklist is recovery guidance rather than ACK, lock acquisition, or cycle completion. Manual reconstruction must read only the canonical cycle-end receipts and must remain visibly incomplete until the exact replay succeeds or the operator explicitly records the manual state.
+
 ## Verification ledger format (Step 1.11)
 
-The verification comment leads with one machine-greppable ledger line. A pass and a failure use **different prefixes** — never a shared `VERIFIED` prefix distinguished only by a `result=` field, or a grep for verification counts a failure as evidence of one:
+Lead the verification comment with one machine-greppable line. Apply the exact verification/v2 grammar, review state rules, canonical fingerprint, and decision procedure in `receipt-protocol.md`; validate it with `scripts/Gatecraft.Protocol.psm1` before close or publication.
 
-```text
-VERIFIED            verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=0   result=pass
-VERIFICATION_FAILED verified_by=<slug> verified_at=<iso8601> commit=<sha> main=<sha> gate="<exact cmd>" exit=<n> result=fail
-```
+Preserve the legacy boundary. Start only the final postmerge pass with `VERIFIED`, keep `verified_by`, `verified_at`, `commit`, `main`, `gate`, `exit=0`, and `result=pass`, and confirm it matches `^VERIFIED\b.*result=pass`. Start baseline and integration/premerge support with `VERIFY_PHASE` so legacy consumers cannot count them as final proof.
 
-Only a `VERIFIED … result=pass` line is durable evidence that the orchestrator ran Step 1.8 successfully; `VERIFICATION_FAILED` records that a check ran and did not pass. Bead closure is a status, not proof — the ledger line is the proof, bound to the exact `commit`, the `main` SHA it was gated against, the gate command, and its exit code. Step 0.12 reconstructs the verified set by grepping only `VERIFIED … result=pass` lines.
+Record a failed final check with the distinct legacy failure prefix `VERIFICATION_FAILED … result=fail`; do not feed that failure ledger line into a candidate pass chain. Treat it as an audit record of the failed decision. Never rename it to `VERIFIED`, and never let closure substitute for a validated final pass.
+
+Sanitize the full validator result before copying its minimal reason codes or receipt projection into `bd`, a handoff snapshot mirror, or a dashboard. Carry the referenced baseline, integration, and terminal review receipt IDs in handoff evidence so a cold successor can reconstruct the exact chain rather than grepping for an unlinked favorable line.

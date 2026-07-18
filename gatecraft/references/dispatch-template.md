@@ -6,7 +6,10 @@ Fill every field — an empty or vague field is exactly what produces an unverif
 You are: <profile-slug>                     (the worker's canonical bd identity from Step 0.2 —
                                              a worker cannot discover this; the prompt is the only channel)
 Bead: <bead-id> — <one-line title>          (use the project tracker's own prefix, whatever it is)
-Worktree: ../repo-wt-<id>-a<n> on branch work/<id>-a<n>   (attempt-scoped; orchestrator fills the actual <n>)
+Worktree: <absolute-worktree-path> on branch work/<id>-a<n>   (attempt-scoped; orchestrator fills the actual path and <n>)
+Worktree platform rule (bootstrap-filled from GC-0.3): <applicable absolute-path rule>
+  Codex/Windows example: C:\Users\<user>\codex-worktrees\<repo>-<id>-a<n> (under the user's home)
+  Unix example for /home/<user>/src/<repo>: /home/<user>/src/<repo>-wt-<id>-a<n> (sibling of the repo)
 
 Task: <what to do, concretely — reference actual file paths/components, not "the login stuff">
 Do NOT touch: <files/areas explicitly out of scope, even if tempting to "fix while you're in there">
@@ -18,6 +21,7 @@ Tool invocation pattern for this project (from Step 0.3): <exact path/flags, e.g
 
 Constraints:
 - Do not read or output the contents of .env, credentials, API keys, or any secret/credential file.
+- Do not copy, symlink, or reuse a real `.env` in this worktree. For database tests use only an orchestrator-provisioned isolated test credential/namespace; do not run schema reset, migration deploy, or destructive database commands against a shared or unknown database.
 - If you repoint any shared-runtime indirection (symlink/mount/dev-env link) to test this, restore it
   to its original target before reporting done — this is part of done, not optional cleanup.
 - Stay inside this worktree; do not push, merge, or touch other worktrees/branches.

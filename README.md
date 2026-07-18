@@ -40,30 +40,48 @@ Hand a backlog to a swarm of agents and the failure mode is always the same: som
 | 🎯 **Gate before dispatch** | A concrete, mechanical definition of done (existing test → targeted script → real-runtime check) is written *before* the worker starts — never a prose task description. |
 | 🧬 **Isolate, then reconcile** | Every bead gets its own worktree; before merge, main is re-integrated and the gate re-runs on the combined result *and* on main itself. |
 | 🔍 **Review ≠ gate** | Behavior gate and security/design review are separate; sensitive paths (auth, payments, secrets, personal data) always get an adversarial reviewer from a *different* profile. |
-| 🤝 **Handoff as temporary regency** | On rate-limit exhaustion the orchestrator role is handed off with a durable snapshot and reclaimed later — with a best-effort lock, heartbeat/staleness rules, and ACK windows to avoid two orchestrators acting at once. |
+| 🤝 **Handoff as temporary regency** | On rate-limit exhaustion the orchestrator role is handed off with a durable snapshot and reclaimed later — with a cooperative same-host Git-common-dir guard, durable best-effort lock, heartbeat/staleness rules, and ACK windows. |
 | 🌙 **Safe unattended operation** | Silence is never authorization. Standing policies decided at bootstrap (succession, worker-exhaustion, unattended ceiling, push/deploy) resolve only what the user explicitly delegated. |
 
-### Why Claude Code drives the orchestrator seat
+### Orchestrator seat compatibility
 
-This is a deliberate design decision, not an oversight: **the orchestrator role is Claude Code–specific, while worker roles are vendor-neutral.** You can dispatch beads to codex, Gemini/AntiGravity, or any capable CLI agent as *workers* — but the agent holding the orchestrator seat should be Claude Code.
+Claude Code is the most field-tested orchestrator seat, not a categorical requirement. Codex also has a verified official-experimental structured quota adapter through codex app-server --stdio and account/rateLimits/read; its path is cleaner than a TUI scrape but has less field history. Worker roles remain vendor-neutral.
 
-The reason is concrete and lives in [`references/codex-quota.md`](gatecraft/references/codex-quota.md): the orchestrator's autonomous rate-limit handoff (Step 3) depends on reading its own usage non-interactively. Claude Code's `/usage` is a best-effort but working channel; codex's cleanest equivalent turned out to be its *official experimental* `codex app-server --stdio` JSON-RPC interface (`account/rateLimits/read`) — cleaner than expected, but still a different, less battle-tested path than `/usage`. The same seat also leans on Claude Code mechanisms for self-identification (`CLAUDE_CONFIG_DIR`) and skill auto-loading.
+Require every orchestrator candidate, regardless of vendor, to pass bootstrap smoke tests for self-identification, usage introspection, non-interactive launch, ACK/lock acquisition, and process-tree reap. Treat skill auto-loading and profile discovery as capabilities to supply through the candidate's own environment; reject automatic succession for a seat that fails any required smoke test. See [references/codex-quota.md](gatecraft/references/codex-quota.md) for the Claude and Codex adapters.
 
 ### Repository layout
 
-```text
+~~~text
 gatecraft/                       # the installable unit — copy this whole folder
-├─ SKILL.md                      # the core protocol (Steps 0–4)
-└─ references/
-   ├─ dispatch-template.md       # the fill-every-field worker prompt
-   ├─ anti-patterns.md           # lived failures → the rules that prevent them
-   ├─ changelog.md               # dated record of every substantive revision
-   ├─ handoff-protocol.md        # Step 3 mechanics: lock, watchdogs, verification ledger
-   ├─ codex-quota.md             # non-interactive usage-channel investigation (both vendors)
-   ├─ dashboard.md               # recommended dashboard tool + multi-source incident detail
-   └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
+├─ SKILL.md                      # core protocol, inline safety invariants, contract routing
+├─ references/
+│  ├─ execution-contract.md      # normative GC-0.0…GC-1.12 records
+│  ├─ local-guard.md             # cooperative local lock + foreign-change baseline/sweep
+│  ├─ cycle-end.md               # receipt-first cycle-end event and recovery contract
+│  ├─ receipt-protocol.md        # verification/v2 receipts, hashing, review, retry rules
+│  ├─ recovery-protocol.md       # attended external-merge audit; permanently non-qualifying
+│  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
+│  ├─ dispatch-template.md       # the fill-every-field worker prompt
+│  ├─ anti-patterns.md           # lived failures → the rules that prevent them
+│  ├─ changelog.md               # dated record of every substantive revision
+│  ├─ handoff-protocol.md        # Step 3 mechanics: lock, watchdogs, verification ledger
+│  ├─ codex-quota.md             # copyable PowerShell usage adapters
+│  ├─ dashboard.md               # recommended dashboard tool + incident detail
+│  └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
+├─ scripts/
+│  ├─ Gatecraft.Protocol.psm1    # deterministic parser, validator, hasher, sanitizer, retry state
+│  ├─ guard.ps1 / guard.sh       # PowerShell 7 + POSIX/Git-Bash local guard entry points
+│  ├─ cycle-end.ps1              # PowerShell 7 receipt-first cycle-end entry point
+│  └─ cycle-end.sh               # POSIX/Git-Bash argument-preserving entry point
+└─ tests/
+   ├─ Test-Guard.ps1             # concurrency, foreign-change, process, path, shell-parity gate
+   ├─ Test-CycleEnd.ps1          # idempotency, conflict, kill/replay, and shell-parity gate
+   ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
+   ├─ Test-RecoveryProtocol.ps1  # attended audit and non-qualification behavioral gate
+   ├─ Test-All.ps1               # fail-fast integrated runner for every Gatecraft gate
+   └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
-```
+~~~
 
 ### Install (short version)
 
@@ -85,8 +103,25 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 - a git repository
 - at least one installed CLI coding agent
 - a real shell (Claude Code CLI or its VS Code extension, or an equivalent shell-capable environment)
+- PowerShell 7 (`pwsh`) and Git; on Windows shell-parity testing uses Git for Windows Bash
 
 `bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything.
+
+### Maintenance
+
+Before committing any change to the skill or its references, maintainers must run all dependency-free protocol gates from the repository root:
+
+```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-All.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+git diff --check
+git add -- <intended-paths>
+git diff --cached --check
+```
 
 ### License
 
@@ -118,30 +153,48 @@ Se affidi un backlog a uno sciame di agenti, il modo di fallire è sempre lo ste
 | 🎯 **Gate prima del dispatch** | Una definizione di "fatto" concreta e meccanica (test esistente → script mirato → check runtime reale) è scritta *prima* che il worker parta — mai una descrizione a parole. |
 | 🧬 **Isola, poi riconcilia** | Ogni bead ha il suo worktree; prima del merge, main viene reintegrato e il gate rigira sul risultato combinato *e* su main stesso. |
 | 🔍 **Review ≠ gate** | Gate comportamentale e review di sicurezza/design sono distinti; i path sensibili (auth, pagamenti, segreti, dati personali) ricevono sempre un reviewer avversariale da un profilo *diverso*. |
-| 🤝 **Handoff come reggenza temporanea** | All'esaurimento del rate-limit il ruolo di orchestratore passa con uno snapshot durevole e viene riottenuto dopo — con lock best-effort, regole di heartbeat/staleness e finestre di ACK per evitare due orchestratori attivi insieme. |
+| 🤝 **Handoff come reggenza temporanea** | All'esaurimento del rate-limit il ruolo passa con uno snapshot durevole — usando un guard cooperativo locale sul Git common-dir, il lock durevole best-effort, heartbeat/staleness e finestre di ACK. |
 | 🌙 **Operatività unattended sicura** | Il silenzio non è mai autorizzazione. Le policy decise al bootstrap (successione, esaurimento worker, tetto unattended, push/deploy) risolvono solo ciò che l'utente ha esplicitamente delegato. |
 
-### Perché è Claude Code a occupare la sedia dell'orchestratore
+### Compatibilità della sedia dell'orchestratore
 
-È una scelta di design deliberata, non una svista: **il ruolo di orchestratore è specifico di Claude Code, mentre i ruoli di worker sono neutri rispetto al vendor.** Puoi dispatchare bead a codex, Gemini/AntiGravity o qualunque CLI agent capace come *worker* — ma l'agente che occupa la sedia dell'orchestratore dovrebbe essere Claude Code.
+Claude Code è la sedia di orchestrazione più collaudata sul campo, non un requisito categorico. Anche Codex dispone di un adapter strutturato verificato e ufficiale-sperimentale tramite codex app-server --stdio e account/rateLimits/read; il canale è più pulito di uno scrape della TUI, ma ha meno esperienza sul campo. I ruoli worker restano neutrali rispetto al vendor.
 
-Il motivo è concreto ed è documentato in [`references/codex-quota.md`](gatecraft/references/codex-quota.md): l'handoff autonomo da rate-limit dell'orchestratore (Step 3) dipende dal leggere il proprio consumo in modo non-interattivo. Il `/usage` di Claude Code è un canale best-effort ma funzionante; l'equivalente più pulito su codex si è rivelato essere la sua interfaccia *ufficiale sperimentale* `codex app-server --stdio` via JSON-RPC (`account/rateLimits/read`) — più pulita del previsto, ma comunque un percorso diverso e meno collaudato di `/usage`. La stessa sedia si appoggia inoltre a meccanismi di Claude Code per l'auto-identificazione (`CLAUDE_CONFIG_DIR`) e l'auto-caricamento delle skill.
+Richiedi a ogni candidato orchestratore, indipendentemente dal vendor, di superare gli smoke test di bootstrap per auto-identificazione, lettura dell'uso, avvio non interattivo, ACK/acquisizione del lock e reap dell'albero dei processi. Tratta auto-caricamento della skill e discovery del profilo come capacità da fornire tramite l'ambiente del candidato; escludi dalla successione automatica una sedia che fallisce un test obbligatorio. Vedi [references/codex-quota.md](gatecraft/references/codex-quota.md) per gli adapter Claude e Codex.
 
 ### Struttura del repository
 
-```text
+~~~text
 gatecraft/                       # l'unità installabile — copia l'intera cartella
-├─ SKILL.md                      # il protocollo core (Step 0–4)
-└─ references/
-   ├─ dispatch-template.md       # il prompt worker con ogni campo da compilare
-   ├─ anti-patterns.md           # fallimenti vissuti → le regole che li prevengono
-   ├─ changelog.md               # registro datato di ogni revisione sostanziale
-   ├─ handoff-protocol.md        # meccanica dello Step 3: lock, watchdog, ledger di verifica
-   ├─ codex-quota.md             # indagine sui canali di uso non-interattivo (entrambi i vendor)
-   ├─ dashboard.md               # tool dashboard consigliato + dettaglio incidente multi-sorgente
-   └─ wordpress.md               # checklist ambiente WordPress + incidente sandbox Windows
+├─ SKILL.md                      # protocollo core, invarianti inline, routing al contratto
+├─ references/
+│  ├─ execution-contract.md      # record normativi GC-0.0…GC-1.12
+│  ├─ local-guard.md             # lock locale cooperativo + baseline/sweep delle modifiche estranee
+│  ├─ cycle-end.md               # evento cycle-end receipt-first e contratto di ripristino
+│  ├─ receipt-protocol.md        # ricevute verification/v2, hash, review e retry
+│  ├─ recovery-protocol.md       # audit attended di merge esterni; mai qualificante
+│  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
+│  ├─ dispatch-template.md       # prompt worker con ogni campo da compilare
+│  ├─ anti-patterns.md           # fallimenti vissuti → regole preventive
+│  ├─ changelog.md               # registro datato delle revisioni sostanziali
+│  ├─ handoff-protocol.md        # Step 3: lock, watchdog e ledger di verifica
+│  ├─ codex-quota.md             # adapter PowerShell copiabili per l'uso
+│  ├─ dashboard.md               # dashboard consigliata + dettaglio incidenti
+│  └─ wordpress.md               # checklist WordPress + incidente sandbox Windows
+├─ scripts/
+│  ├─ Gatecraft.Protocol.psm1    # parser, validatore, hash, sanitizzazione e retry deterministici
+│  ├─ guard.ps1 / guard.sh       # entry point PowerShell 7 + POSIX/Git-Bash del guard locale
+│  ├─ cycle-end.ps1              # entry point receipt-first per PowerShell 7
+│  └─ cycle-end.sh               # entry point POSIX/Git-Bash che preserva gli argomenti
+└─ tests/
+   ├─ Test-Guard.ps1             # gate concorrenza, modifiche estranee, processi, path e parità shell
+   ├─ Test-CycleEnd.ps1          # gate idempotenza, conflitti, kill/replay e parità shell
+   ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
+   ├─ Test-RecoveryProtocol.ps1  # gate audit attended e non qualificazione
+   ├─ Test-All.ps1               # runner integrato fail-fast per tutti i gate Gatecraft
+   └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
-```
+~~~
 
 ### Installazione (versione breve)
 
@@ -163,8 +216,25 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 - un repository git
 - almeno un CLI coding agent installato
 - una shell reale (Claude Code CLI o la sua estensione VS Code, o un ambiente equivalente con shell)
+- PowerShell 7 (`pwsh`) e Git; su Windows il test di parità usa Bash di Git for Windows
 
 `bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa.
+
+### Manutenzione
+
+Prima di committare qualsiasi modifica alla skill o ai suoi riferimenti, i maintainer devono eseguire tutti i gate del protocollo senza dipendenze dalla root del repository:
+
+```powershell
+pwsh -NoProfile -File gatecraft/tests/Test-All.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
+git diff --check
+git add -- <percorsi-intenzionali>
+git diff --cached --check
+```
 
 ### Licenza
 
