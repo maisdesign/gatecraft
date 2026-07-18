@@ -1,6 +1,11 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Reuse the production cycle-begin-marker parser from Gatecraft.Protocol.psm1 rather than
+# hand-rolling a second one here; restrict the import to that single function so it never
+# shadows this script's own local copies of the receipt/ledger helpers below.
+Import-Module (Join-Path $PSScriptRoot 'Gatecraft.Protocol.psm1') -Function 'Read-GatecraftCycleBeginMarker' -Force -ErrorAction Stop
+
 function Write-CycleEndUsage {
     [Console]::Out.WriteLine(@'
 Usage:
@@ -590,6 +595,31 @@ try {
     catch {
         Write-ProjectionFailure -Mode $mode -EventId $eventId -Sequence $sequence -Message $_.Exception.Message
         exit 74
+    }
+
+    # Clear the GC-1.10 cycle-begin marker (Gatecraft.Protocol.psm1's
+    # New-GatecraftCycleBeginMarker) as the very last action, strictly after every
+    # projection is durable, and only when it targets the exact sequence this invocation
+    # is completing. A crash between the projection writes above and this deletion must
+    # still read as in-progress on the next reclaim-boundary check; an identical replay
+    # of this same event reaches this point again and retries it. A marker present but
+    # targeting a different sequence (e.g. a delayed replay of an older cycle-end racing
+    # a newer merge's live marker) is not this invocation's to clean up, and a malformed
+    # marker is left untouched rather than deleted -- neither case is a failure of this
+    # cycle-end's own completed work, since the marker's lifecycle is a separate concern.
+    $cycleBeginMarkerPath = [IO.Path]::Combine($cycleRoot, 'in-progress.marker')
+    Assert-NotReparsePoint -Path $cycleBeginMarkerPath -Label 'cycle-begin marker'
+    if ([IO.File]::Exists($cycleBeginMarkerPath)) {
+        $cycleBeginMarker = $null
+        try {
+            $cycleBeginMarker = Read-GatecraftCycleBeginMarker -Path $cycleBeginMarkerPath
+        }
+        catch {
+            $cycleBeginMarker = $null
+        }
+        if ($null -ne $cycleBeginMarker -and $cycleBeginMarker.TargetCycleSequence -eq $sequence) {
+            [IO.File]::Delete($cycleBeginMarkerPath)
+        }
     }
 
     [Console]::Out.WriteLine("CYCLE_END_COMPLETE event_id=$eventId sequence=$sequence receipt=$receiptDisposition projections=complete")

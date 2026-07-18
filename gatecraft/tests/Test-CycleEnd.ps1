@@ -19,6 +19,8 @@ else {
     }
 }
 $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+$protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
+Import-Module $protocolModulePath -Force -ErrorAction Stop
 $testControlsEnvironmentVariable = 'GATECRAFT_CYCLE_END_TEST_CONTROLS'
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 $fixturePrefix = "gatecraft-cycle-end-$PID-"
@@ -353,6 +355,179 @@ try {
         $failures.Add($_.Exception.Message)
     }
 
+    # Test-GatecraftReclaimBoundary: reclaim_at is only a valid boundary right after a
+    # cycle-end event has durably completed every rebuilt projection.
+    $reclaimOkRoot = New-FixtureRoot
+    $reclaimOk = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimOkRoot -EventId 'reclaim-ok')
+    Assert-Equal $reclaimOk.ExitCode 0 "Reclaim-boundary fixture cycle-end failed: $($reclaimOk.Text)"
+    $reclaimOkResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimOkRoot
+    Assert-Equal $reclaimOkResult.Reason 'ok' 'A completed cycle-end boundary must permit reclaim.'
+    Assert-True ([bool] $reclaimOkResult.Allowed) 'A completed cycle-end boundary must report Allowed=true.'
+
+    # Ping-pong: a second, still-in-flight cycle on the same root must block reclaim
+    # again even though an earlier cycle on that same root already completed cleanly.
+    $reclaimSecondCycleFailpoint = Invoke-WithTestControlsEnvironment -Enabled $true -Action {
+        Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimOkRoot -EventId 'reclaim-ok-2' -Sequence '2' -Extra @('--failpoint', 'after-receipt', '--failpoint-action', 'exit'))
+    }
+    Assert-Equal $reclaimSecondCycleFailpoint.ExitCode 86 "Second-cycle after-receipt failpoint must exit 86: $($reclaimSecondCycleFailpoint.Text)"
+    $reclaimSecondCycleResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimOkRoot
+    Assert-Equal $reclaimSecondCycleResult.Reason 'blocked-mid-merge' 'A newer receipt whose projection rebuild has not caught up must block reclaim even though an older cycle already completed.'
+    Assert-True (-not [bool] $reclaimSecondCycleResult.Allowed) 'A stale dashboard behind the latest receipt must not permit reclaim.'
+    $reclaimSecondCycleReplay = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimOkRoot -EventId 'reclaim-ok-2' -Sequence '2')
+    Assert-Equal $reclaimSecondCycleReplay.ExitCode 0 "Replay to repair the second-cycle fixture failed: $($reclaimSecondCycleReplay.Text)"
+    $reclaimSecondCycleReplayResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimOkRoot
+    Assert-Equal $reclaimSecondCycleReplayResult.Reason 'ok' 'Completing the second cycle must restore a valid reclaim boundary at the new sequence.'
+    Assert-True ([bool] $reclaimSecondCycleReplayResult.Allowed) 'A repaired second-cycle boundary must permit reclaim again.'
+
+    $reclaimNoLedgerRoot = New-FixtureRoot
+    $reclaimNoLedgerResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimNoLedgerRoot
+    Assert-Equal $reclaimNoLedgerResult.Reason 'blocked-no-ledger' 'A state root with no cycle-end history must block reclaim as no-ledger.'
+    Assert-True (-not [bool] $reclaimNoLedgerResult.Allowed) 'No ledger must not permit reclaim.'
+
+    $reclaimRelativeResult = Test-GatecraftReclaimBoundary -StateRoot 'relative-reclaim-state'
+    Assert-Equal $reclaimRelativeResult.Reason 'blocked-no-ledger' 'A non-absolute state root must fail closed as no-ledger.'
+    Assert-True (-not [bool] $reclaimRelativeResult.Allowed) 'A non-absolute state root must not permit reclaim.'
+
+    $reclaimMidMergeRoot = New-FixtureRoot
+    $reclaimMidMerge = Invoke-WithTestControlsEnvironment -Enabled $true -Action {
+        Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMidMergeRoot -EventId 'reclaim-mid-merge' -Extra @('--failpoint', 'after-receipt', '--failpoint-action', 'exit'))
+    }
+    Assert-Equal $reclaimMidMerge.ExitCode 86 "Deterministic after-receipt failpoint must exit 86: $($reclaimMidMerge.Text)"
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimMidMergeRoot 'cycle-end/receipts') -PathType Container) 'The receipt directory must exist after the after-receipt failpoint.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $reclaimMidMergeRoot 'cycle-end/dashboard.json') -PathType Leaf)) 'The after-receipt failpoint must land before any projection is written.'
+    $reclaimMidMergeResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMidMergeRoot
+    Assert-Equal $reclaimMidMergeResult.Reason 'blocked-mid-merge' 'A receipt without a durable projection rebuild must block reclaim as mid-merge.'
+    Assert-True (-not [bool] $reclaimMidMergeResult.Allowed) 'Mid-merge state must not permit reclaim.'
+    $reclaimMidMergeReplay = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMidMergeRoot -EventId 'reclaim-mid-merge')
+    Assert-Equal $reclaimMidMergeReplay.ExitCode 0 "Replay to repair the interrupted mid-merge fixture failed: $($reclaimMidMergeReplay.Text)"
+    $reclaimMidMergeReplayResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMidMergeRoot
+    Assert-Equal $reclaimMidMergeReplayResult.Reason 'ok' 'Replaying the exact event to completion must restore a valid reclaim boundary.'
+    Assert-True ([bool] $reclaimMidMergeReplayResult.Allowed) 'A repaired boundary must permit reclaim again.'
+
+    $reclaimMalformedRoot = New-FixtureRoot
+    $reclaimMalformedReceipts = Join-Path $reclaimMalformedRoot 'cycle-end/receipts'
+    [void] [IO.Directory]::CreateDirectory($reclaimMalformedReceipts)
+    [IO.File]::WriteAllText((Join-Path $reclaimMalformedReceipts 'not-a-canonical-receipt.json'), '{}')
+    $reclaimMalformedResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMalformedRoot
+    Assert-Equal $reclaimMalformedResult.Reason 'blocked-malformed-ledger' 'A corrupt receipt ledger must block reclaim as malformed.'
+    Assert-True (-not [bool] $reclaimMalformedResult.Allowed) 'Malformed ledger state must not permit reclaim.'
+
+    # A dashboard.json that exists but fails exhaustive canonical validation is corrupt
+    # durable state, not an in-flight window, and must be reported distinctly from
+    # blocked-mid-merge.
+    $reclaimMalformedDashboardRoot = New-FixtureRoot
+    $reclaimMalformedDashboardFirstCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMalformedDashboardRoot -EventId 'reclaim-malformed-dashboard')
+    Assert-Equal $reclaimMalformedDashboardFirstCycle.ExitCode 0 "Malformed-dashboard fixture's cycle-end failed: $($reclaimMalformedDashboardFirstCycle.Text)"
+    [IO.File]::WriteAllText((Join-Path $reclaimMalformedDashboardRoot 'cycle-end/dashboard.json'), '{"protocol":"gatecraft-cycle/dashboard-v1","cycle_count":"not-a-number","latest":{}}')
+    $reclaimMalformedDashboardResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMalformedDashboardRoot
+    Assert-Equal $reclaimMalformedDashboardResult.Reason 'blocked-malformed-ledger' 'A dashboard that exists but fails canonical validation must block reclaim as malformed, not mid-merge.'
+    Assert-True (-not [bool] $reclaimMalformedDashboardResult.Allowed) 'A malformed dashboard must not permit reclaim.'
+
+    # Mid-merge via a live cycle-begin marker (GC-1.10 has started but not yet
+    # completed): the previous cycle's receipt and dashboard still fully agree with each
+    # other, so only the marker reveals a merge/ledger/cycle-end sequence in flight right
+    # now -- this is the exact ping-pong gap the receipt/dashboard check alone cannot
+    # see, distinct from the older after-receipt-failpoint fixture above which covers a
+    # different, narrower window (a written receipt whose own projection rebuild has not
+    # yet caught up).
+    $reclaimMarkerRoot = New-FixtureRoot
+    $reclaimMarkerFirstCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMarkerRoot -EventId 'reclaim-marker-1')
+    Assert-Equal $reclaimMarkerFirstCycle.ExitCode 0 "Marker fixture's first cycle-end failed: $($reclaimMarkerFirstCycle.Text)"
+    $reclaimMarkerFirstResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMarkerRoot
+    Assert-Equal $reclaimMarkerFirstResult.Reason 'ok' 'The first completed cycle must be a clean reclaim boundary before the marker fixture begins.'
+
+    $reclaimMarker = New-GatecraftCycleBeginMarker -StateRoot $reclaimMarkerRoot -CreatedAtUtc '2026-07-15T10:16:00Z'
+    Assert-Equal $reclaimMarker.TargetCycleSequence 2 'The cycle-begin marker must target the sequence one past the latest completed receipt.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimMarkerRoot 'cycle-end/in-progress.marker') -PathType Leaf) 'New-GatecraftCycleBeginMarker must create the marker file.'
+    $reclaimMarkerMidResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMarkerRoot
+    Assert-Equal $reclaimMarkerMidResult.Reason 'blocked-mid-merge' 'A live cycle-begin marker targeting an unreached sequence must block reclaim even though the previous receipt and dashboard still fully agree.'
+    Assert-True (-not [bool] $reclaimMarkerMidResult.Allowed) 'A live cycle-begin marker must not permit reclaim.'
+
+    $reclaimMarkerSecondCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMarkerRoot -EventId 'reclaim-marker-2' -Sequence '2')
+    Assert-Equal $reclaimMarkerSecondCycle.ExitCode 0 "Marker fixture's second cycle-end failed: $($reclaimMarkerSecondCycle.Text)"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $reclaimMarkerRoot 'cycle-end/in-progress.marker') -PathType Leaf)) 'cycle-end.ps1 must delete the cycle-begin marker as the very last action of a successful run.'
+    $reclaimMarkerAfterResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimMarkerRoot
+    Assert-Equal $reclaimMarkerAfterResult.Reason 'ok' 'Completing the marked cycle must clear the marker and restore a valid reclaim boundary.'
+    Assert-True ([bool] $reclaimMarkerAfterResult.Allowed) 'A repaired boundary must permit reclaim again once the marker is cleared.'
+
+    # Round-2 review Finding 1: a marker whose target sequence exactly equals the latest
+    # completed receipt simulates a crash between writing the final dashboard and
+    # deleting the marker. A sequence comparison (target > latest) lets this slip through
+    # as "ok"; only existence-based blocking, regardless of target, is correct. Create the
+    # marker before the cycle it targets even starts, then let cycle-end run all the way
+    # through the dashboard write and stop at the after-dashboard failpoint -- strictly
+    # after the dashboard is durable but strictly before the marker would be deleted.
+    $reclaimCrashBeforeDeleteRoot = New-FixtureRoot
+    $reclaimCrashBeforeDeleteMarker = New-GatecraftCycleBeginMarker -StateRoot $reclaimCrashBeforeDeleteRoot -CreatedAtUtc '2026-07-15T10:17:00Z'
+    Assert-Equal $reclaimCrashBeforeDeleteMarker.TargetCycleSequence 1 'The pre-cycle marker on an empty ledger must target sequence 1.'
+    $reclaimCrashBeforeDelete = Invoke-WithTestControlsEnvironment -Enabled $true -Action {
+        Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimCrashBeforeDeleteRoot -EventId 'reclaim-crash-before-delete' -Extra @('--failpoint', 'after-dashboard', '--failpoint-action', 'exit'))
+    }
+    Assert-Equal $reclaimCrashBeforeDelete.ExitCode 86 "After-dashboard failpoint must exit 86: $($reclaimCrashBeforeDelete.Text)"
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimCrashBeforeDeleteRoot 'cycle-end/dashboard.json') -PathType Leaf) 'The after-dashboard failpoint must land after the dashboard is durable.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimCrashBeforeDeleteRoot 'cycle-end/in-progress.marker') -PathType Leaf) 'The after-dashboard failpoint must land strictly before the marker is deleted.'
+    $reclaimCrashBeforeDeleteResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimCrashBeforeDeleteRoot
+    Assert-Equal $reclaimCrashBeforeDeleteResult.Reason 'blocked-mid-merge' 'A marker whose target equals the latest completed sequence must still block reclaim (crash-before-delete window).'
+    Assert-True (-not [bool] $reclaimCrashBeforeDeleteResult.Allowed) 'A stale-but-present marker must never permit reclaim, regardless of its target sequence.'
+    $reclaimCrashBeforeDeleteReplay = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimCrashBeforeDeleteRoot -EventId 'reclaim-crash-before-delete')
+    Assert-Equal $reclaimCrashBeforeDeleteReplay.ExitCode 0 "Replay to clear the crash-before-delete marker failed: $($reclaimCrashBeforeDeleteReplay.Text)"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $reclaimCrashBeforeDeleteRoot 'cycle-end/in-progress.marker') -PathType Leaf)) 'Replaying the exact same completed sequence must delete its own matching marker.'
+    $reclaimCrashBeforeDeleteAfterResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimCrashBeforeDeleteRoot
+    Assert-Equal $reclaimCrashBeforeDeleteAfterResult.Reason 'ok' 'Clearing the crash-before-delete marker must restore a valid reclaim boundary.'
+    Assert-True ([bool] $reclaimCrashBeforeDeleteAfterResult.Allowed) 'A repaired boundary must permit reclaim again.'
+
+    # Round-2 review Finding 2: cycle-end.ps1 must never delete a marker that targets a
+    # sequence other than the one this specific invocation is completing. A delayed
+    # replay of an older, already-completed cycle-end call must not tear down a newer
+    # cycle's live in-flight marker, and the older replay's own work must still succeed.
+    $reclaimMarkerMismatchRoot = New-FixtureRoot
+    $reclaimMarkerMismatchFirstCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMarkerMismatchRoot -EventId 'reclaim-marker-mismatch-1')
+    Assert-Equal $reclaimMarkerMismatchFirstCycle.ExitCode 0 "Marker-mismatch fixture's first cycle-end failed: $($reclaimMarkerMismatchFirstCycle.Text)"
+    $reclaimMarkerMismatchMarker = New-GatecraftCycleBeginMarker -StateRoot $reclaimMarkerMismatchRoot -CreatedAtUtc '2026-07-15T10:18:00Z'
+    Assert-Equal $reclaimMarkerMismatchMarker.TargetCycleSequence 2 'The in-flight marker must target the next sequence (2), not the older sequence about to be replayed (1).'
+    $reclaimMarkerMismatchReplay = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimMarkerMismatchRoot -EventId 'reclaim-marker-mismatch-1')
+    Assert-Equal $reclaimMarkerMismatchReplay.ExitCode 0 "A delayed replay of the older, already-completed sequence must still succeed on its own: $($reclaimMarkerMismatchReplay.Text)"
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimMarkerMismatchRoot 'cycle-end/in-progress.marker') -PathType Leaf) 'A marker targeting a different sequence than the one just replayed must survive untouched.'
+    $reclaimMarkerMismatchMarkerAfter = Read-GatecraftCycleBeginMarker -Path (Join-Path $reclaimMarkerMismatchRoot 'cycle-end/in-progress.marker')
+    Assert-Equal $reclaimMarkerMismatchMarkerAfter.TargetCycleSequence 2 'The surviving marker must retain its original target sequence untouched.'
+
+    # Round-2 review Finding 3: a marker created after every one of this function's own
+    # earlier checks but before its final marker-existence check must still block. No
+    # independent process can be raced deterministically against a single synchronous
+    # PowerShell call, so use the module's dedicated test-only injection point (mirroring
+    # cycle-end.ps1's own failpoint mechanism) to create the marker at that exact gap.
+    $reclaimLateMarkerRoot = New-FixtureRoot
+    $reclaimLateMarkerFirstCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimLateMarkerRoot -EventId 'reclaim-late-marker')
+    Assert-Equal $reclaimLateMarkerFirstCycle.ExitCode 0 "Late-marker fixture's cycle-end failed: $($reclaimLateMarkerFirstCycle.Text)"
+    $reclaimLateMarkerBeforeResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimLateMarkerRoot
+    Assert-Equal $reclaimLateMarkerBeforeResult.Reason 'ok' 'The unmodified fixture must be a clean reclaim boundary before the injected race.'
+    $reclaimLateMarkerResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimLateMarkerRoot -BeforeFinalMarkerCheck {
+        [void] (New-GatecraftCycleBeginMarker -StateRoot $reclaimLateMarkerRoot -CreatedAtUtc '2026-07-15T10:19:00Z')
+    }
+    Assert-Equal $reclaimLateMarkerResult.Reason 'blocked-mid-merge' 'A marker created after every earlier check but before the final check must still block reclaim.'
+    Assert-True (-not [bool] $reclaimLateMarkerResult.Allowed) 'A late-appearing marker must never permit reclaim.'
+    Assert-True (Test-Path -LiteralPath (Join-Path $reclaimLateMarkerRoot 'cycle-end/in-progress.marker') -PathType Leaf) 'The injection hook must actually have run and created the marker.'
+
+    # Round-2 review Finding 4: count/ID/sequence agreement between the receipt ledger
+    # and the dashboard projection is not sufficient -- every latest field must agree, or
+    # the dashboard has not actually caught up to what the receipt says happened. Tamper
+    # only the dashboard's "latest.outcome", keeping cycle_count/event_id/cycle_sequence
+    # identical to the real receipt. The tampered "latest" fragment is hand-built in the
+    # same canonical byte layout cycle-end.ps1 and the module both use (verified above by
+    # the fixture's own untampered 'ok' result), so it still passes the dashboard's own
+    # internal-consistency validation and isolates exactly the outcome mismatch under test.
+    $reclaimFieldMismatchRoot = New-FixtureRoot
+    $reclaimFieldMismatchFirstCycle = Invoke-CycleEnd -Arguments (Get-EventArguments -StateRoot $reclaimFieldMismatchRoot -EventId 'reclaim-field-mismatch' -Outcome 'continue' -Summary 'Original canonical summary.')
+    Assert-Equal $reclaimFieldMismatchFirstCycle.ExitCode 0 "Field-mismatch fixture's cycle-end failed: $($reclaimFieldMismatchFirstCycle.Text)"
+    $reclaimFieldMismatchOkResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimFieldMismatchRoot
+    Assert-Equal $reclaimFieldMismatchOkResult.Reason 'ok' 'The unmodified fixture must be a clean reclaim boundary before tampering.'
+    $reclaimFieldMismatchTamperedLatest = '{"cycle_sequence":1,"event_id":"reclaim-field-mismatch","event_type":"cycle-end","mode":"attended","occurred_at":"2026-07-15T10:15:30.0000000Z","outcome":"failed","protocol":"gatecraft-cycle/v1","summary":"Original canonical summary."}'
+    $reclaimFieldMismatchTamperedDashboard = '{"cycle_count":1,"latest":' + $reclaimFieldMismatchTamperedLatest + ',"protocol":"gatecraft-cycle/dashboard-v1"}'
+    [IO.File]::WriteAllText((Join-Path $reclaimFieldMismatchRoot 'cycle-end/dashboard.json'), $reclaimFieldMismatchTamperedDashboard)
+    $reclaimFieldMismatchResult = Test-GatecraftReclaimBoundary -StateRoot $reclaimFieldMismatchRoot
+    Assert-Equal $reclaimFieldMismatchResult.Reason 'blocked-mid-merge' 'A dashboard whose latest.outcome disagrees with the actual receipt must block reclaim even though count/ID/sequence agree.'
+    Assert-True (-not [bool] $reclaimFieldMismatchResult.Allowed) 'An outcome-mismatched dashboard must not permit reclaim.'
+
     # Kill a real child immediately after each named durable write, then replay.
     foreach ($boundary in @('after-receipt', 'after-session-log', 'after-heartbeat', 'after-snapshot', 'after-dashboard')) {
         $interruptionRoot = New-FixtureRoot
@@ -423,5 +598,5 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Host 'Cycle-end gate passed: duplicate/conflict/sequence, platform Bash parity, gated test controls, five kill/replay boundaries, fail-closed projections, and safe cleanup.'
+Write-Host 'Cycle-end gate passed: duplicate/conflict/sequence, platform Bash parity, gated test controls, five kill/replay boundaries, fail-closed projections, reclaim-boundary guard, cycle-begin-marker ping-pong guard (existence-based blocking, sequence-scoped marker deletion, marker TOCTOU closure, exhaustive latest-field dashboard comparison), and safe cleanup.'
 exit 0

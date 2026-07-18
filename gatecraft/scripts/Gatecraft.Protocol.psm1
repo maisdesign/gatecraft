@@ -863,6 +863,700 @@ function ConvertTo-GatecraftDashboardProjection {
     return Protect-GatecraftText -Text $json -KnownSecret $KnownSecret
 }
 
+function New-GatecraftReclaimResult {
+    param(
+        [Parameter(Mandatory)][bool] $Allowed,
+        [Parameter(Mandatory)][string] $Reason
+    )
+
+    [pscustomobject][ordered]@{
+        Protocol = 'gatecraft-reclaim/v1'
+        Allowed = $Allowed
+        Reason = $Reason
+    }
+}
+
+function Assert-NotReparsePoint {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    $isDirectory = [IO.Directory]::Exists($Path)
+    $isFile = [IO.File]::Exists($Path)
+    if (-not $isDirectory -and -not $isFile) {
+        return
+    }
+    $info = if ($isDirectory) { [IO.DirectoryInfo]::new($Path) } else { [IO.FileInfo]::new($Path) }
+    if (
+        ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not [string]::IsNullOrEmpty($info.LinkTarget)
+    ) {
+        throw "path-reparse: reject symbolic-link, junction, mount, or reparse indirection at $Label."
+    }
+}
+
+function Assert-SafeText {
+    param(
+        [Parameter(Mandatory)][string] $Value,
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][int] $MaximumLength
+    )
+
+    if (
+        [string]::IsNullOrWhiteSpace($Value) -or
+        $Value.Length -gt $MaximumLength -or
+        $Value -cne $Value.Trim() -or
+        -not $Value.IsNormalized([Text.NormalizationForm]::FormC) -or
+        $Value -match '[\x00-\x1F\x7F]'
+    ) {
+        throw "$Label-invalid: require nonempty NFC text without leading/trailing whitespace or control characters (maximum $MaximumLength characters)."
+    }
+}
+
+function ConvertTo-CanonicalTimestamp {
+    param([Parameter(Mandatory)][string] $Value)
+
+    if ($Value -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$') {
+        throw 'occurred-at-invalid: require a timezone-qualified RFC3339 timestamp with seconds.'
+    }
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse(
+        $Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::None,
+        [ref] $parsed
+    )) {
+        throw 'occurred-at-invalid: reject an invalid RFC3339 timestamp.'
+    }
+    return $parsed.ToUniversalTime().ToString(
+        "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'",
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function ConvertTo-JsonString {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Value)
+    return ConvertTo-Json -InputObject ([string] $Value) -Compress -EscapeHandling EscapeNonAscii
+}
+
+function New-CanonicalReceipt {
+    param(
+        [Parameter(Mandatory)][long] $Sequence,
+        [Parameter(Mandatory)][string] $EventId,
+        [Parameter(Mandatory)][string] $Mode,
+        [Parameter(Mandatory)][string] $OccurredAt,
+        [Parameter(Mandatory)][string] $Outcome,
+        [Parameter(Mandatory)][string] $Summary
+    )
+
+    $canonical = '{' +
+        '"cycle_sequence":' + $Sequence.ToString([Globalization.CultureInfo]::InvariantCulture) + ',' +
+        '"event_id":' + (ConvertTo-JsonString $EventId) + ',' +
+        '"event_type":"cycle-end",' +
+        '"mode":' + (ConvertTo-JsonString $Mode) + ',' +
+        '"occurred_at":' + (ConvertTo-JsonString $OccurredAt) + ',' +
+        '"outcome":' + (ConvertTo-JsonString $Outcome) + ',' +
+        '"protocol":"gatecraft-cycle/v1",' +
+        '"summary":' + (ConvertTo-JsonString $Summary) +
+        '}'
+
+    return [pscustomobject][ordered]@{
+        CycleSequence = $Sequence
+        EventId = $EventId
+        EventType = 'cycle-end'
+        Mode = $Mode
+        OccurredAt = $OccurredAt
+        Outcome = $Outcome
+        Protocol = 'gatecraft-cycle/v1'
+        Summary = $Summary
+        Canonical = $canonical
+    }
+}
+
+function Read-CanonicalReceipt {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-NotReparsePoint -Path $Path -Label 'canonical receipt'
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) {
+        throw 'receipt-corrupt: reject an empty canonical receipt.'
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw 'receipt-corrupt: reject a UTF-8 BOM in a canonical receipt.'
+    }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    if ($text.Contains("`r", [StringComparison]::Ordinal) -or $text.Contains("`n", [StringComparison]::Ordinal)) {
+        throw 'receipt-corrupt: a canonical receipt must be exactly one JSON value with no trailing newline.'
+    }
+
+    $document = [Text.Json.JsonDocument]::Parse($text)
+    try {
+        $root = $document.RootElement
+        if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
+            throw 'receipt-corrupt: canonical receipt root must be an object.'
+        }
+
+        $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($name in @('cycle_sequence', 'event_id', 'event_type', 'mode', 'occurred_at', 'outcome', 'protocol', 'summary')) {
+            [void] $allowed.Add($name)
+        }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $fields = [Collections.Generic.Dictionary[string,Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+        foreach ($property in $root.EnumerateObject()) {
+            if (-not $allowed.Contains($property.Name) -or -not $seen.Add($property.Name)) {
+                throw "receipt-corrupt: reject unknown or duplicate property '$($property.Name)'."
+            }
+            $fields.Add($property.Name, $property.Value.Clone())
+        }
+        if ($seen.Count -ne $allowed.Count) {
+            throw 'receipt-corrupt: canonical receipt fields are incomplete.'
+        }
+
+        [long] $sequence = 0
+        if ($fields['cycle_sequence'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $fields['cycle_sequence'].TryGetInt64([ref] $sequence)) {
+            throw 'receipt-corrupt: cycle_sequence must be an integer.'
+        }
+        foreach ($name in @('event_id', 'event_type', 'mode', 'occurred_at', 'outcome', 'protocol', 'summary')) {
+            if ($fields[$name].ValueKind -ne [Text.Json.JsonValueKind]::String) {
+                throw "receipt-corrupt: property '$name' must be a string."
+            }
+        }
+
+        $persistedEventId = $fields['event_id'].GetString()
+        $persistedMode = $fields['mode'].GetString()
+        $persistedOccurredAt = $fields['occurred_at'].GetString()
+        $persistedOutcome = $fields['outcome'].GetString()
+        $persistedSummary = $fields['summary'].GetString()
+        if ($sequence -lt 1 -or $persistedEventId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+            throw 'receipt-corrupt: reject an invalid persisted sequence or event ID.'
+        }
+        if ($persistedMode -cnotin @('attended', 'unattended') -or $persistedOutcome -cnotin @('continue', 'completed', 'failed', 'quiescent', 'waiting-external')) {
+            throw 'receipt-corrupt: reject an invalid persisted mode or outcome.'
+        }
+        Assert-SafeText -Value $persistedSummary -Label 'receipt-summary' -MaximumLength 2048
+        if ((ConvertTo-CanonicalTimestamp -Value $persistedOccurredAt) -cne $persistedOccurredAt) {
+            throw 'receipt-corrupt: persisted timestamp is not in canonical UTC form.'
+        }
+
+        $receipt = New-CanonicalReceipt -Sequence $sequence -EventId $persistedEventId -Mode $persistedMode -OccurredAt $persistedOccurredAt -Outcome $persistedOutcome -Summary $persistedSummary
+
+        if ($fields['event_type'].GetString() -cne 'cycle-end' -or $fields['protocol'].GetString() -cne 'gatecraft-cycle/v1') {
+            throw 'receipt-corrupt: reject an unknown event type or protocol.'
+        }
+        if ($receipt.Canonical -cne $text) {
+            throw 'receipt-corrupt: receipt bytes are not in canonical UTF-8 JSON form.'
+        }
+        return $receipt
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Write-AtomicUtf8 {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Text,
+        [switch] $CreateOnly
+    )
+
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    Assert-NotReparsePoint -Path $directory -Label 'write parent directory'
+    if ([IO.Directory]::Exists($Path)) {
+        throw 'path-type: output path is an existing directory.'
+    }
+    Assert-NotReparsePoint -Path $Path -Label 'output file'
+
+    $temporary = [IO.Path]::Combine($directory, '.cycle-end-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+        $stream = [IO.FileStream]::new(
+            $temporary,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None,
+            4096,
+            [IO.FileOptions]::WriteThrough
+        )
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+
+        if ($CreateOnly) {
+            [IO.File]::Move($temporary, $Path, $false)
+        }
+        else {
+            [IO.File]::Move($temporary, $Path, $true)
+        }
+    }
+    finally {
+        if ([IO.File]::Exists($temporary)) {
+            [IO.File]::Delete($temporary)
+        }
+    }
+}
+
+function Ensure-SafeDirectory {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    if ([IO.File]::Exists($Path) -and -not [IO.Directory]::Exists($Path)) {
+        throw "path-type: $Label must be a directory."
+    }
+    Assert-NotReparsePoint -Path $Path -Label $Label
+    [void] [IO.Directory]::CreateDirectory($Path)
+    Assert-NotReparsePoint -Path $Path -Label $Label
+}
+
+function Get-CanonicalLedger {
+    param([Parameter(Mandatory)][string] $ReceiptDirectory)
+
+    Assert-NotReparsePoint -Path $ReceiptDirectory -Label 'receipt directory'
+    $entries = @([IO.DirectoryInfo]::new($ReceiptDirectory).GetFileSystemInfos() | Sort-Object -Property Name)
+    $receipts = [Collections.Generic.List[object]]::new()
+    $ids = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    [long] $expected = 1
+
+    foreach ($entry in $entries) {
+        if ($entry -isnot [IO.FileInfo] -or $entry.Name -notmatch '^(?<sequence>[0-9]{19})--(?<id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\.json$') {
+            throw "receipt-directory-corrupt: reject unexpected entry '$($entry.Name)' in the canonical receipt directory."
+        }
+        $filenameMatch = [regex]::Match($entry.Name, '^(?<sequence>[0-9]{19})--(?<id>[A-Za-z0-9][A-Za-z0-9._-]{0,127})\.json$', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+        Assert-NotReparsePoint -Path $entry.FullName -Label 'canonical receipt entry'
+        [long] $fileSequence = 0
+        if (-not [long]::TryParse($filenameMatch.Groups['sequence'].Value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref] $fileSequence)) {
+            throw 'receipt-directory-corrupt: receipt filename sequence is outside Int64.'
+        }
+        $receipt = Read-CanonicalReceipt -Path $entry.FullName
+        if (
+            $receipt.CycleSequence -ne $fileSequence -or
+            $receipt.EventId -cne $filenameMatch.Groups['id'].Value -or
+            $receipt.CycleSequence -ne $expected -or
+            -not $ids.Add($receipt.EventId)
+        ) {
+            throw 'receipt-ledger-invalid: canonical receipts must have unique IDs and contiguous positive sequences beginning at one.'
+        }
+        $receipts.Add($receipt)
+        $expected++
+    }
+
+    return @($receipts)
+}
+
+function ConvertTo-GatecraftCycleBeginMarker {
+    param(
+        [Parameter(Mandatory)][long] $TargetCycleSequence,
+        [Parameter(Mandatory)][string] $CreatedAt
+    )
+
+    return '{' +
+        '"created_at":' + (ConvertTo-JsonString $CreatedAt) + ',' +
+        '"protocol":"gatecraft-cycle-begin/v1",' +
+        '"target_cycle_sequence":' + $TargetCycleSequence.ToString([Globalization.CultureInfo]::InvariantCulture) +
+        '}'
+}
+
+function Read-GatecraftCycleBeginMarker {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-NotReparsePoint -Path $Path -Label 'cycle-begin marker'
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) {
+        throw 'marker-corrupt: reject an empty cycle-begin marker.'
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw 'marker-corrupt: reject a UTF-8 BOM in a cycle-begin marker.'
+    }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    if ($text.Contains("`r", [StringComparison]::Ordinal) -or $text.Contains("`n", [StringComparison]::Ordinal)) {
+        throw 'marker-corrupt: a cycle-begin marker must be exactly one JSON value with no trailing newline.'
+    }
+
+    $document = [Text.Json.JsonDocument]::Parse($text)
+    try {
+        $root = $document.RootElement
+        if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
+            throw 'marker-corrupt: cycle-begin marker root must be an object.'
+        }
+        $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($name in @('created_at', 'protocol', 'target_cycle_sequence')) {
+            [void] $allowed.Add($name)
+        }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $fields = [Collections.Generic.Dictionary[string,Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+        foreach ($property in $root.EnumerateObject()) {
+            if (-not $allowed.Contains($property.Name) -or -not $seen.Add($property.Name)) {
+                throw "marker-corrupt: reject unknown or duplicate property '$($property.Name)'."
+            }
+            $fields.Add($property.Name, $property.Value.Clone())
+        }
+        if ($seen.Count -ne $allowed.Count) {
+            throw 'marker-corrupt: cycle-begin marker fields are incomplete.'
+        }
+        if ($fields['protocol'].ValueKind -ne [Text.Json.JsonValueKind]::String -or $fields['protocol'].GetString() -cne 'gatecraft-cycle-begin/v1') {
+            throw 'marker-corrupt: reject an unknown cycle-begin marker protocol.'
+        }
+        [long] $target = 0
+        if ($fields['target_cycle_sequence'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $fields['target_cycle_sequence'].TryGetInt64([ref] $target) -or $target -lt 1) {
+            throw 'marker-corrupt: target_cycle_sequence must be a positive integer.'
+        }
+        if ($fields['created_at'].ValueKind -ne [Text.Json.JsonValueKind]::String) {
+            throw 'marker-corrupt: created_at must be a string.'
+        }
+        $createdAt = $fields['created_at'].GetString()
+        if ((ConvertTo-CanonicalTimestamp -Value $createdAt) -cne $createdAt) {
+            throw 'marker-corrupt: created_at is not in canonical UTC form.'
+        }
+        $canonical = ConvertTo-GatecraftCycleBeginMarker -TargetCycleSequence $target -CreatedAt $createdAt
+        if ($canonical -cne $text) {
+            throw 'marker-corrupt: cycle-begin marker bytes are not in canonical UTF-8 JSON form.'
+        }
+        return [pscustomobject][ordered]@{ TargetCycleSequence = $target; CreatedAt = $createdAt }
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Read-GatecraftDashboardProjection {
+    param([Parameter(Mandatory)][string] $Path)
+
+    Assert-NotReparsePoint -Path $Path -Label 'cycle-end dashboard'
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) {
+        throw 'dashboard-corrupt: reject an empty dashboard projection.'
+    }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw 'dashboard-corrupt: reject a UTF-8 BOM in the dashboard projection.'
+    }
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    if ($text.Contains("`r", [StringComparison]::Ordinal) -or $text.Contains("`n", [StringComparison]::Ordinal)) {
+        throw 'dashboard-corrupt: the dashboard projection must be exactly one JSON value with no trailing newline.'
+    }
+
+    $document = [Text.Json.JsonDocument]::Parse($text)
+    try {
+        $root = $document.RootElement
+        if ($root.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
+            throw 'dashboard-corrupt: dashboard projection root must be an object.'
+        }
+        $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($name in @('cycle_count', 'latest', 'protocol')) {
+            [void] $allowed.Add($name)
+        }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $fields = [Collections.Generic.Dictionary[string,Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+        foreach ($property in $root.EnumerateObject()) {
+            if (-not $allowed.Contains($property.Name) -or -not $seen.Add($property.Name)) {
+                throw "dashboard-corrupt: reject unknown or duplicate property '$($property.Name)'."
+            }
+            $fields.Add($property.Name, $property.Value.Clone())
+        }
+        if ($seen.Count -ne $allowed.Count) {
+            throw 'dashboard-corrupt: dashboard projection fields are incomplete.'
+        }
+        if ($fields['protocol'].ValueKind -ne [Text.Json.JsonValueKind]::String -or $fields['protocol'].GetString() -cne 'gatecraft-cycle/dashboard-v1') {
+            throw 'dashboard-corrupt: reject an unknown dashboard protocol.'
+        }
+        [long] $cycleCount = 0
+        if ($fields['cycle_count'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $fields['cycle_count'].TryGetInt64([ref] $cycleCount) -or $cycleCount -lt 0) {
+            throw 'dashboard-corrupt: cycle_count must be a nonnegative integer.'
+        }
+        if ($fields['latest'].ValueKind -ne [Text.Json.JsonValueKind]::Object) {
+            throw "dashboard-corrupt: 'latest' must be an object."
+        }
+
+        $latestText = $fields['latest'].GetRawText()
+        $latestAllowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($name in @('cycle_sequence', 'event_id', 'event_type', 'mode', 'occurred_at', 'outcome', 'protocol', 'summary')) {
+            [void] $latestAllowed.Add($name)
+        }
+        $latestSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $latestFields = [Collections.Generic.Dictionary[string,Text.Json.JsonElement]]::new([StringComparer]::Ordinal)
+        foreach ($property in $fields['latest'].EnumerateObject()) {
+            if (-not $latestAllowed.Contains($property.Name) -or -not $latestSeen.Add($property.Name)) {
+                throw "dashboard-corrupt: reject unknown or duplicate 'latest' property '$($property.Name)'."
+            }
+            $latestFields.Add($property.Name, $property.Value.Clone())
+        }
+        if ($latestSeen.Count -ne $latestAllowed.Count) {
+            throw "dashboard-corrupt: 'latest' fields are incomplete."
+        }
+
+        [long] $latestSequence = 0
+        if ($latestFields['cycle_sequence'].ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $latestFields['cycle_sequence'].TryGetInt64([ref] $latestSequence)) {
+            throw "dashboard-corrupt: 'latest.cycle_sequence' must be an integer."
+        }
+        foreach ($name in @('event_id', 'event_type', 'mode', 'occurred_at', 'outcome', 'protocol', 'summary')) {
+            if ($latestFields[$name].ValueKind -ne [Text.Json.JsonValueKind]::String) {
+                throw "dashboard-corrupt: 'latest.$name' must be a string."
+            }
+        }
+        $latestEventId = $latestFields['event_id'].GetString()
+        $latestMode = $latestFields['mode'].GetString()
+        $latestOccurredAt = $latestFields['occurred_at'].GetString()
+        $latestOutcome = $latestFields['outcome'].GetString()
+        $latestSummary = $latestFields['summary'].GetString()
+        if ($latestSequence -lt 1 -or $latestEventId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+            throw "dashboard-corrupt: 'latest' has an invalid persisted sequence or event ID."
+        }
+        if ($latestMode -cnotin @('attended', 'unattended') -or $latestOutcome -cnotin @('continue', 'completed', 'failed', 'quiescent', 'waiting-external')) {
+            throw "dashboard-corrupt: 'latest' has an invalid mode or outcome."
+        }
+        Assert-SafeText -Value $latestSummary -Label 'dashboard-latest-summary' -MaximumLength 2048
+        if ((ConvertTo-CanonicalTimestamp -Value $latestOccurredAt) -cne $latestOccurredAt) {
+            throw "dashboard-corrupt: 'latest.occurred_at' is not in canonical UTC form."
+        }
+        if ($latestFields['event_type'].GetString() -cne 'cycle-end' -or $latestFields['protocol'].GetString() -cne 'gatecraft-cycle/v1') {
+            throw "dashboard-corrupt: 'latest' has an unknown event type or protocol."
+        }
+
+        $expectedLatestCanonical = (New-CanonicalReceipt -Sequence $latestSequence -EventId $latestEventId -Mode $latestMode -OccurredAt $latestOccurredAt -Outcome $latestOutcome -Summary $latestSummary).Canonical
+        if ($expectedLatestCanonical -cne $latestText) {
+            throw "dashboard-corrupt: 'latest' bytes are not in canonical UTF-8 JSON form."
+        }
+
+        $expectedDashboard = '{' + '"cycle_count":' + $cycleCount.ToString([Globalization.CultureInfo]::InvariantCulture) + ',' + '"latest":' + $expectedLatestCanonical + ',' + '"protocol":"gatecraft-cycle/dashboard-v1"}'
+        if ($expectedDashboard -cne $text) {
+            throw 'dashboard-corrupt: dashboard bytes are not in canonical UTF-8 JSON form.'
+        }
+
+        return [pscustomobject][ordered]@{
+            CycleCount = $cycleCount
+            LatestEventId = $latestEventId
+            LatestSequence = $latestSequence
+            LatestMode = $latestMode
+            LatestOccurredAt = $latestOccurredAt
+            LatestOutcome = $latestOutcome
+            LatestSummary = $latestSummary
+        }
+    }
+    finally {
+        $document.Dispose()
+    }
+}
+
+function Test-GatecraftReclaimBoundary {
+    <#
+    Determines whether "now" is a valid reclaim_at boundary (handoff-protocol.md,
+    "Temporary regency"). cycle-end.ps1 rebuilds session-log/heartbeat/snapshot/dashboard
+    from the complete ledger in that fixed order and only reaches CYCLE_END_COMPLETE
+    after every projection lands; dashboard.json is written last, so a dashboard that
+    already reflects the latest fully-parsed, content-validated receipt shows every
+    earlier projection also completed. That alone cannot detect a merge/ledger/cycle-end
+    sequence that is currently in flight but has not yet written its next receipt, since
+    the previous receipt and dashboard still agree with each other during that whole
+    window (GC-1.10 through GC-1.12) — so this also consults the lightweight cycle-begin
+    marker (New-GatecraftCycleBeginMarker) that the orchestrator creates immediately
+    before merge begins and that cycle-end.ps1 deletes only as its very last action,
+    strictly after the final dashboard write. Because deletion is intentionally the very
+    last action of a successful run, the marker's mere existence is what proves the
+    sequence has not fully finished — including the crash window between writing that
+    final dashboard and deleting the marker, where the receipt/dashboard agreement alone
+    would otherwise look clean. The marker's target sequence is therefore irrelevant to
+    this decision and is never compared; only presence/absence is checked, and that check
+    runs last, immediately before the only true-returning statement, so a marker that
+    appears after every earlier check in this same call still blocks (minimizing the
+    TOCTOU gap the receipt-list rescan alone cannot see - it does not mathematically
+    eliminate a check-to-caller-action race; that guarantee depends on the caller
+    retaining the cooperative local guard across the check and its subsequent action).
+    A missing dashboard, a live
+    cycle-begin marker, a receipt list that changes between two reads taken inside this
+    same check, or a latest receipt whose mode/timestamp/outcome/summary the dashboard
+    does not exactly reflect are each exactly the mid-boundary/in-flight state left
+    behind by a crash or an actively running Step 1.10-1.12 sequence; a dashboard that
+    exists but fails exhaustive canonical validation is corrupt durable state, not an
+    in-flight window, and is reported distinctly. Every one of these fails closed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $StateRoot,
+        # Test-only synchronous injection point: when supplied, invoked immediately
+        # before the final marker-existence check (after every other check has already
+        # run) so a test can deterministically prove a marker created in that exact gap
+        # still blocks reclaim. No production caller wires this parameter; it is a no-op
+        # whenever omitted.
+        [scriptblock] $BeforeFinalMarkerCheck
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StateRoot) -or -not [IO.Path]::IsPathFullyQualified($StateRoot)) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-no-ledger'
+    }
+
+    $stateRootFull = $null
+    try {
+        $stateRootFull = [IO.Path]::GetFullPath($StateRoot)
+    }
+    catch {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-no-ledger'
+    }
+
+    $cycleRoot = Join-Path $stateRootFull 'cycle-end'
+    $receiptDirectory = Join-Path $cycleRoot 'receipts'
+    $dashboardPath = Join-Path $cycleRoot 'dashboard.json'
+    $markerPath = Join-Path $cycleRoot 'in-progress.marker'
+
+    try {
+        Assert-NotReparsePoint -Path $stateRootFull -Label 'state root'
+        Assert-NotReparsePoint -Path $cycleRoot -Label 'cycle-end state directory'
+        Assert-NotReparsePoint -Path $receiptDirectory -Label 'canonical receipt directory'
+        Assert-NotReparsePoint -Path $dashboardPath -Label 'cycle-end dashboard'
+        Assert-NotReparsePoint -Path $markerPath -Label 'cycle-begin marker'
+    }
+    catch {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-malformed-ledger'
+    }
+
+    $ledgerExists = [IO.Directory]::Exists($receiptDirectory)
+    $ledger = @()
+    if ($ledgerExists) {
+        try {
+            $ledger = @(Get-CanonicalLedger -ReceiptDirectory $receiptDirectory)
+        }
+        catch {
+            return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-malformed-ledger'
+        }
+    }
+    $latestSequence = if ($ledger.Count -gt 0) { $ledger[-1].CycleSequence } else { 0 }
+    $latestEventId = if ($ledger.Count -gt 0) { $ledger[-1].EventId } else { $null }
+    $latestReceipt = if ($ledger.Count -gt 0) { $ledger[-1] } else { $null }
+
+    if (-not $ledgerExists -or $ledger.Count -eq 0) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-no-ledger'
+    }
+
+    if (-not [IO.File]::Exists($dashboardPath)) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+
+    $dashboard = $null
+    try {
+        $dashboard = Read-GatecraftDashboardProjection -Path $dashboardPath
+    }
+    catch {
+        # The dashboard file exists but failed exhaustive canonical validation: that is
+        # corrupt/malformed durable state, not a transient in-flight window, so it must
+        # never be conflated with (or silently coerced into) the mid-merge reason.
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-malformed-ledger'
+    }
+
+    if (
+        $dashboard.CycleCount -ne $ledger.Count -or
+        $dashboard.LatestEventId -cne $latestEventId -or
+        $dashboard.LatestSequence -ne $latestSequence -or
+        $dashboard.LatestMode -cne $latestReceipt.Mode -or
+        $dashboard.LatestOccurredAt -cne $latestReceipt.OccurredAt -or
+        $dashboard.LatestOutcome -cne $latestReceipt.Outcome -or
+        $dashboard.LatestSummary -cne $latestReceipt.Summary
+    ) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+
+    # TOCTOU guard: re-read the receipt list after the dashboard read and require it to be
+    # unchanged, including every field the dashboard claims to reflect (not just count/ID/
+    # sequence). A change here is evidence a concurrent cycle-end is running right now.
+    $rescanLedger = $null
+    try {
+        $rescanLedger = @(Get-CanonicalLedger -ReceiptDirectory $receiptDirectory)
+    }
+    catch {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+    if ($rescanLedger.Count -eq 0 -or $rescanLedger.Count -ne $ledger.Count) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+    $rescanLatestReceipt = $rescanLedger[-1]
+    if (
+        $rescanLatestReceipt.EventId -cne $latestEventId -or
+        $rescanLatestReceipt.CycleSequence -ne $latestSequence -or
+        $rescanLatestReceipt.Mode -cne $latestReceipt.Mode -or
+        $rescanLatestReceipt.OccurredAt -cne $latestReceipt.OccurredAt -or
+        $rescanLatestReceipt.Outcome -cne $latestReceipt.Outcome -or
+        $rescanLatestReceipt.Summary -cne $latestReceipt.Summary
+    ) {
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+
+    if ($null -ne $BeforeFinalMarkerCheck) {
+        & $BeforeFinalMarkerCheck
+    }
+
+    # Existence-based cycle-begin-marker check, evaluated last: cycle-end.ps1 deletes the
+    # marker only as the very last action of a successful run, strictly after every
+    # projection (including the dashboard just validated above) is durable, so the
+    # marker's mere presence -- regardless of which sequence it targets, including the
+    # sequence just confirmed complete above -- proves the GC-1.10-1.12 sequence has not
+    # yet fully finished (e.g. a crash between writing the final dashboard and deleting
+    # the marker). Checking this last, after the rescan, means a marker created anywhere
+    # in the gap since this call started still blocks.
+    if ([IO.File]::Exists($markerPath)) {
+        try {
+            [void] (Read-GatecraftCycleBeginMarker -Path $markerPath)
+        }
+        catch {
+            return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-malformed-ledger'
+        }
+        return New-GatecraftReclaimResult -Allowed $false -Reason 'blocked-mid-merge'
+    }
+
+    return New-GatecraftReclaimResult -Allowed $true -Reason 'ok'
+}
+
+function New-GatecraftCycleBeginMarker {
+    <#
+    Orchestrator-level GC-1.10 primitive, called immediately before merge begins: marks
+    "a cycle has begun and not yet completed" under StateRoot so Test-GatecraftReclaimBoundary
+    can detect an in-flight merge/ledger/cycle-end sequence even though the previous
+    cycle's receipt and dashboard still fully agree with each other. cycle-end.ps1 deletes
+    this marker as the very last action of a successful run, strictly after every
+    projection is durable (references/cycle-end.md).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $StateRoot,
+        [Parameter(Mandatory)][string] $CreatedAtUtc
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StateRoot) -or -not [IO.Path]::IsPathFullyQualified($StateRoot)) {
+        throw 'state-root-invalid: require an absolute state root.'
+    }
+    $stateRootFull = [IO.Path]::GetFullPath($StateRoot)
+    Assert-NotReparsePoint -Path $stateRootFull -Label 'state root'
+
+    $cycleRoot = Join-Path $stateRootFull 'cycle-end'
+    Ensure-SafeDirectory -Path $cycleRoot -Label 'cycle-end state directory'
+
+    $receiptDirectory = Join-Path $cycleRoot 'receipts'
+    $ledger = @()
+    if ([IO.Directory]::Exists($receiptDirectory)) {
+        $ledger = @(Get-CanonicalLedger -ReceiptDirectory $receiptDirectory)
+    }
+    [long] $targetCycleSequence = $ledger.Count + 1
+
+    # The protocol module must stay pure (no wall-clock reads) - the caller (the
+    # orchestrator, at GC-1.10) supplies the current UTC time rather than this
+    # function reading it itself.
+    $createdAt = ConvertTo-CanonicalTimestamp -Value $CreatedAtUtc
+
+    $markerPath = Join-Path $cycleRoot 'in-progress.marker'
+    $canonical = ConvertTo-GatecraftCycleBeginMarker -TargetCycleSequence $targetCycleSequence -CreatedAt $createdAt
+    Write-AtomicUtf8 -Path $markerPath -Text $canonical -CreateOnly
+
+    return [pscustomobject][ordered]@{
+        Protocol = 'gatecraft-cycle-begin/v1'
+        TargetCycleSequence = $targetCycleSequence
+        CreatedAt = $createdAt
+        Path = $markerPath
+    }
+}
+
 function Get-GatecraftAggregateFingerprint {
     [CmdletBinding()]
     param(
@@ -1177,6 +1871,9 @@ Export-ModuleMember -Function @(
     'ConvertTo-GatecraftRecoveryProjection',
     'Test-GatecraftVerificationChain',
     'ConvertTo-GatecraftDashboardProjection',
+    'Test-GatecraftReclaimBoundary',
+    'New-GatecraftCycleBeginMarker',
+    'Read-GatecraftCycleBeginMarker',
     'Get-GatecraftAggregateFingerprint',
     'Resolve-GatecraftRetrySequence'
 )
