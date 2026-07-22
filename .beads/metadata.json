@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "gatecraft",
+  "project_id": "ea5404f6-c8b6-4c29-8037-043d16a9b78a"
+}
