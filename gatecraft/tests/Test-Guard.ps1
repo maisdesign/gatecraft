@@ -707,16 +707,18 @@ try {
         Assert-True (-not $registeredAfterDescendant.Contains($wtDescendantPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Worktree-remove must unregister the worktree from git.'
         $descendantChild.Dispose()
 
-        # probe-child-window: a direct, deterministic exercise of the ancestry-window bound logic itself
-        # (Get-ChildProcessRecords' -MaximumStartExclusive) that external review round 16's finding
-        # depends on, and round 17 added to close it. Real OS-level PID reuse cannot be forced on demand,
-        # so this does not simulate reuse directly; instead it proves the actual rejection mechanism works
-        # against a REAL, live parent/child pair by supplying a --maximum-start that falls before the
-        # child's own real creation time (mimicking what a stale/expired upper bound looks like from the
-        # query's perspective) and confirming the child is excluded, then repeating with a bound that
-        # legitimately spans the child's creation and confirming it is included. This is the same
-        # mechanism that would reject a reused-PID impostor's children once the original PID's own
-        # confirmed exit time becomes the upper bound.
+        # probe-child-window: a direct, deterministic exercise of Get-ChildProcessRecords' real, live-
+        # process discovery and $MinimumStart ancestry-lower-bound logic against a REAL parent/child pair.
+        # This no longer tests any upper-bound/timestamp-window mechanism -- external review round 17
+        # found that approach (a caller-read wall-clock exit timestamp, `-MaximumStartExclusive`) unsound
+        # (an exact-instant tie was wrongly excluded, and system time is not guaranteed monotonic across
+        # process events), so round 18 replaced it entirely with real OS handle-pinning (see
+        # Stop-DescendantProcesses' own comment) rather than patching the timestamp comparison. Real OS-
+        # level PID reuse still cannot be forced on demand in a test, so this proves what CAN be proven
+        # deterministically: a genuine live child is discovered and accepted (and its returned handle is a
+        # real, open, usable native handle -- confirmed by successfully querying it before this test closes
+        # it), and a candidate whose creation predates the declared parent's own start is still rejected
+        # (round 14's original ancestor-side defense, unaffected by this round's change).
         $probeRepo = New-TestRepository 'probe-child-window-repo'
         $probeTargetFile = Join-Path $testRoot 'probe-child-window-target.txt'
         $probeChildPidFile = Join-Path $testRoot 'probe-child-window-child-pid.txt'
@@ -729,17 +731,19 @@ try {
         $probeChild = [Diagnostics.Process]::GetProcessById($probeChildPid)
         Assert-True (-not $probeChild.HasExited) 'probe-child-window fixture child must still be alive.'
 
-        $probeIncludedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeRootStart,'--maximum-start','2999-01-01T00:00:00.0000000Z') -TestControls $true -TimeoutMilliseconds 30000
-        Assert-Equal $probeIncludedResult.ExitCode 0 "probe-child-window must succeed with a legitimate window. stdout=$($probeIncludedResult.Output) stderr=$($probeIncludedResult.Error)"
+        $probeIncludedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeRootStart) -TestControls $true -TimeoutMilliseconds 30000
+        Assert-Equal $probeIncludedResult.ExitCode 0 "probe-child-window must succeed for a real live child. stdout=$($probeIncludedResult.Output) stderr=$($probeIncludedResult.Error)"
         $probeIncludedIds = @(ConvertFrom-Json -InputObject $probeIncludedResult.Output)
-        Assert-True ($probeChildPid -in $probeIncludedIds) "A real child created within [minimum-start, maximum-start) must be accepted. probed=$($probeIncludedResult.Output)"
+        Assert-True ($probeChildPid -in $probeIncludedIds) "A real, live child created at-or-after --minimum-start must be accepted. probed=$($probeIncludedResult.Output)"
+        Assert-True (-not $probeChild.HasExited) 'probe-child-window must never terminate a discovered candidate -- it is read-only.'
 
-        $probeExcludedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeRootStart,'--maximum-start',$probeRootStart) -TestControls $true -TimeoutMilliseconds 30000
-        Assert-Equal $probeExcludedResult.ExitCode 0 "probe-child-window must succeed even when nothing falls in the window. stdout=$($probeExcludedResult.Output) stderr=$($probeExcludedResult.Error)"
+        $probeFutureBound = ([DateTime]::UtcNow.AddDays(3650)).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+        $probeExcludedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeFutureBound) -TestControls $true -TimeoutMilliseconds 30000
+        Assert-Equal $probeExcludedResult.ExitCode 0 "probe-child-window must succeed even when nothing meets the bound. stdout=$($probeExcludedResult.Output) stderr=$($probeExcludedResult.Error)"
         $probeExcludedIds = @(ConvertFrom-Json -InputObject $probeExcludedResult.Output)
-        Assert-True ($probeChildPid -notin $probeExcludedIds) "A real child created at-or-after --maximum-start must be rejected -- this is the exact mechanism that rejects a reused-PID impostor's own children once the original PID's confirmed exit time becomes the upper bound. probed=$($probeExcludedResult.Output)"
+        Assert-True ($probeChildPid -notin $probeExcludedIds) "A real child created before --minimum-start must be rejected as ancestry-unrelated (round 14's lower-bound defense, still in force after round 18's rewrite). probed=$($probeExcludedResult.Output)"
 
-        $probeGatedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeRootStart,'--maximum-start','2999-01-01T00:00:00.0000000Z') -TestControls $false -TimeoutMilliseconds 30000
+        $probeGatedResult = Invoke-Guard -Arguments @('probe-child-window','--repository-root',$probeRepo,'--parent-pid',([string]$probeRoot.Id),'--minimum-start',$probeRootStart) -TestControls $false -TimeoutMilliseconds 30000
         Assert-True ($probeGatedResult.ExitCode -ne 0 -and $probeGatedResult.Error -match 'code=test-controls-disabled') "probe-child-window must refuse to run without GATECRAFT_GUARD_TEST_CONTROLS=1, like every other test-only surface. stderr=$($probeGatedResult.Error)"
         $probeChild.Dispose()
 
