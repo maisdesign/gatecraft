@@ -1373,7 +1373,6 @@ function Invoke-WorktreeRemove {
     $mode = "clean"
     $state = Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart
     if ($state -ceq 'process-unverifiable') { throw 'worktree-holder-unverifiable' }
-    $rootStopped = $false
     if ($state -ceq 'ok') {
         # Stop the exact declared worker through one native handle opened with only the rights this needs
         # (see Stop-DeclaredWorktreeWorker) -- not .NET's Process.Handle/SafeHandle, whose implicit
@@ -1388,19 +1387,33 @@ function Invoke-WorktreeRemove {
         # and is therefore fully enumerable by walking ParentProcessId from here on.
         Stop-DeclaredWorktreeWorker -ProcessId $workerPid -ExpectedStart $workerStart
         if ((Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart) -cne 'process-dead') { throw 'worktree-holder-alive' }
-        $rootStopped = $true
-    }
+        $mode = 'recovered'
 
-    # A child the declared worker already spawned (its own CWD elsewhere, so it never blocks a removal
-    # attempt) can outlive the worker and still write a tracked change before it exits on its own,
-    # reproducing the exact same data loss this bead exists to close — just one process generation down
-    # (lived: found by external review round 12). This sweep runs unconditionally, even when $state was
-    # never 'ok' (the declared worker had already exited, or its PID no longer matches, before this call):
-    # Windows never revokes a live child's historical ParentProcessId when its parent exits, so an already-
-    # dead declared worker can still have live children needing to be stopped (lived: found by external
-    # review round 13).
-    $descendantsStopped = Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -MaxCount 256 -MaxPasses 6
-    if ($rootStopped -or $descendantsStopped) { $mode = 'recovered' }
+        # A child the declared worker already spawned (its own CWD elsewhere, so it never blocks a
+        # removal attempt) can outlive the worker and still write a tracked change before it exits on its
+        # own, reproducing the exact same data loss this bead exists to close — just one process
+        # generation down (lived: found by external review round 12).
+        #
+        # Deliberately scoped to only run here, immediately after THIS call validated $workerPid as the
+        # exact declared worker (state was 'ok' a moment ago) and then killed it itself: within that
+        # narrow, uninterrupted window there has been no opportunity for Windows to reuse $workerPid for
+        # an unrelated process, so "children of $workerPid" unambiguously means the declared worker's own
+        # children. Round 13 tried running this same sweep unconditionally (including when $state was
+        # 'process-dead' or 'process-start-mismatch' — the declared worker already gone or replaced before
+        # this call even started), reasoning that ParentProcessId is fixed at creation and outlives its
+        # parent. That is true, but round 15 review found a sharper problem it doesn't solve: if
+        # $workerPid was reused by a wholly unrelated live process U between the declared worker's actual
+        # exit and this invocation, "children of $workerPid" now means U's own real, legitimate children —
+        # a creation-time lower bound alone cannot tell U's child apart from the declared worker's, since
+        # both were created after the declared worker's own start. Closing that fully would need an upper
+        # bound on exactly when the declared worker's own reign over this PID ended, which this command has
+        # no way to know precisely from the outside — or a Windows Job Object assigned at spawn time,
+        # tracking real membership instead of inferring it from a recycled PID number. Accepted as a known,
+        # narrower guarantee: this sweep only ever runs against a PID this exact call just confirmed and
+        # killed as the genuine declared worker, never against a PID whose identity this call could not
+        # itself just verify.
+        [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -MaxCount 256 -MaxPasses 6)
+    }
 
     Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
     $adminDir = Get-WorktreeAdminDir -Context $Context -WorktreePath $worktreePath
