@@ -396,38 +396,75 @@ function Get-ChildProcessRecords {
     # subsequent "ParentProcessId=<this pid>" query can ever be confused by an unrelated process reusing
     # the number, because the number provably cannot have been reused yet. A rejected/dead candidate's
     # handle is closed immediately here, since there is nothing left to protect once it is not accepted.
+    # KNOWN RESIDUAL GAP (found by external review round 18, not fixed -- accepted, see
+    # Stop-DescendantProcesses' own note): $MinimumStart is itself a wall-clock FILETIME comparison, and
+    # round 18 correctly extended round 17's "system time is not guaranteed monotonic" finding to this
+    # lower bound too -- a backward clock adjustment could in principle either wrongly reject a genuine
+    # child (its recorded creation time now reads earlier than its true parent's) or wrongly accept a
+    # reused-PID impostor's child (an old, unrelated ancestor's real child now reads as created after the
+    # current occupant's start). Handle-pinning (this function's own core fix, round 17->18) closes PID
+    # reuse from the moment of validation FORWARD; it cannot authenticate ancestry claims that depend on
+    # comparing two wall-clock readings taken before that pin ever existed, and Windows exposes no simple
+    # monotonic, cross-process creation-order API to replace FILETIME comparison here. This is the same
+    # category of gap as the two already-accepted ones below (dead-intermediary-before-first-query;
+    # skip-sweep-when-worker-already-dead) -- real, narrow, and requiring infrastructure outside this
+    # function (a monotonic ordering primitive, or a Windows Job Object) to close completely.
     param([Parameter(Mandatory)][int] $ParentProcessId, [Parameter(Mandatory)][DateTime] $MinimumStart)
     Initialize-GatecraftNativeProcess
     $access = 0x00101001  # PROCESS_TERMINATE (0x0001) | PROCESS_QUERY_LIMITED_INFORMATION (0x1000) | SYNCHRONIZE (0x00100000)
+    $errorInvalidParameter = 87  # ERROR_INVALID_PARAMETER: no process exists with this PID -- genuinely gone.
     try {
         $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction Stop)
     }
     catch { throw 'worktree-holder-descendant-unverifiable' }
     $records = [Collections.Generic.List[object]]::new()
-    foreach ($row in $rows) {
-        if ($null -eq $row.CreationDate) { throw 'worktree-holder-descendant-unverifiable' }
-        $childPid = [int]$row.ProcessId
-        $handle = [Gatecraft.NativeProcess]::OpenProcess($access, $false, [uint32]$childPid)
-        if ($handle -eq [IntPtr]::Zero) { continue }  # already gone -- nothing to pin, nothing to kill
-        $accepted = $false
-        try {
-            [uint32]$exitCode = 0
-            if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw 'worktree-holder-descendant-unverifiable' }
-            if ($exitCode -ne 259) { continue }  # already exited -- STILL_ACTIVE check
-            [long]$creation = 0; [long]$exitTime = 0; [long]$kernelTime = 0; [long]$userTime = 0
-            if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { throw 'worktree-holder-descendant-unverifiable' }
-            $actualStartUtc = [DateTime]::FromFileTimeUtc($creation)
-            $deltaTicks = [Math]::Abs(($row.CreationDate.ToUniversalTime() - $actualStartUtc).Ticks)
-            if ($deltaTicks -ge 10) { continue }
-            if ($actualStartUtc -lt $MinimumStart) { continue }
-            $canonicalStart = $actualStartUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
-            $records.Add([pscustomobject]@{ ProcessId = $childPid; Start = $canonicalStart; StartUtc = $actualStartUtc; Handle = $handle })
-            $accepted = $true
+    $completedNormally = $false
+    try {
+        foreach ($row in $rows) {
+            if ($null -eq $row.CreationDate) { throw 'worktree-holder-descendant-unverifiable' }
+            $childPid = [int]$row.ProcessId
+            $handle = [Gatecraft.NativeProcess]::OpenProcess($access, $false, [uint32]$childPid)
+            if ($handle -eq [IntPtr]::Zero) {
+                # A NULL handle alone is not proof of death (lived: found by external review round 18) --
+                # Windows returns NULL for ERROR_ACCESS_DENIED just as it does for a genuinely nonexistent
+                # PID, and a live candidate whose ACL denies the requested rights would otherwise be
+                # silently treated as "already gone" and skipped by both discovery and final confirmation,
+                # while it remains free to write to the worktree. Only ERROR_INVALID_PARAMETER -- no
+                # process exists with this PID -- is actually conclusive; any other reason fails closed,
+                # matching this project's established "unverifiable fails closed" standard.
+                $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if ($lastError -eq $errorInvalidParameter) { continue }
+                throw 'worktree-holder-descendant-unverifiable'
+            }
+            $accepted = $false
+            try {
+                [uint32]$exitCode = 0
+                if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw 'worktree-holder-descendant-unverifiable' }
+                if ($exitCode -ne 259) { continue }  # already exited -- STILL_ACTIVE check
+                [long]$creation = 0; [long]$exitTime = 0; [long]$kernelTime = 0; [long]$userTime = 0
+                if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { throw 'worktree-holder-descendant-unverifiable' }
+                $actualStartUtc = [DateTime]::FromFileTimeUtc($creation)
+                $deltaTicks = [Math]::Abs(($row.CreationDate.ToUniversalTime() - $actualStartUtc).Ticks)
+                if ($deltaTicks -ge 10) { continue }
+                if ($actualStartUtc -lt $MinimumStart) { continue }
+                $canonicalStart = $actualStartUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+                $records.Add([pscustomobject]@{ ProcessId = $childPid; Start = $canonicalStart; StartUtc = $actualStartUtc; Handle = $handle })
+                $accepted = $true
+            }
+            catch { throw 'worktree-holder-descendant-unverifiable' }
+            finally { if (-not $accepted) { [void][Gatecraft.NativeProcess]::CloseHandle($handle) } }
         }
-        catch { throw 'worktree-holder-descendant-unverifiable' }
-        finally { if (-not $accepted) { [void][Gatecraft.NativeProcess]::CloseHandle($handle) } }
+        $completedNormally = $true
+        return ,$records.ToArray()
     }
-    return ,$records.ToArray()
+    finally {
+        # If this function is exiting via an exception (a later CIM row was unverifiable, for example),
+        # every handle already accepted into $records earlier in THIS SAME call has not yet been handed to
+        # any caller and would otherwise leak (lived: found by external review round 18) -- close them all
+        # here. On a normal return, ownership passes to the caller and this is a no-op ($completedNormally
+        # is true, nothing in $records is touched).
+        if (-not $completedNormally) { foreach ($record in $records) { [void][Gatecraft.NativeProcess]::CloseHandle($record.Handle) } }
+    }
 }
 
 function Stop-DescendantProcesses {
@@ -473,6 +510,13 @@ function Stop-DescendantProcesses {
     # for this function's entire run, no "ParentProcessId=<that pid>" query anywhere in this sweep can ever
     # be confused by an unrelated process reusing the number, because reuse is structurally impossible
     # while pinned -- no wall-clock reasoning needed or trusted anywhere in this function.
+    #
+    # KNOWN RESIDUAL GAP #3 (documented, not fixed -- found by external review round 18): pinning closes
+    # PID reuse from the moment of validation forward, but every candidate still has to clear
+    # Get-ChildProcessRecords' `$MinimumStart` lower bound first, which is itself a wall-clock FILETIME
+    # comparison and inherits the same non-monotonic-system-time risk round 17 found in the (now-removed)
+    # upper bound. See that function's own comment for the exact scenario and why it is accepted rather
+    # than fixed here, alongside gap #1 above.
     param([Parameter(Mandatory)][int] $RootProcessId, [Parameter(Mandatory)][string] $RootStart, [Parameter(Mandatory)][IntPtr] $RootHandle, [Parameter(Mandatory)][int] $MaxCount, [Parameter(Mandatory)][int] $MaxPasses)
     Initialize-GatecraftNativeProcess
     # Maps each known PID in this sweep to its own validated creation time (the root's caller-declared
@@ -495,10 +539,17 @@ function Stop-DescendantProcesses {
             foreach ($knownPid in @($seenStarts.Keys)) {
                 $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
                 foreach ($child in $children) {
-                    if ($seenStarts.ContainsKey($child.ProcessId)) { [void][Gatecraft.NativeProcess]::CloseHandle($child.Handle); continue }
-                    if ($seenStarts.Count -gt $MaxCount) { [void][Gatecraft.NativeProcess]::CloseHandle($child.Handle); throw 'worktree-holder-descendants-unbounded' }
-                    $seenStarts[$child.ProcessId] = $child.StartUtc
+                    # Pin immediately, before any check below that could throw (lived: found by external
+                    # review round 18 -- a MaxCount throw partway through this loop left every not-yet-
+                    # processed handle in $children neither pinned nor closed, an unrecoverable leak). Every
+                    # handle Get-ChildProcessRecords ever hands back is now owned by $pinnedHandles the
+                    # instant we have it, so the enclosing function-level `finally` closes it exactly once
+                    # no matter what happens next. A duplicate PID's handle (already tracked from an earlier
+                    # pass) just stays pinned, redundant but harmless, until that same cleanup.
                     $pinnedHandles.Add($child.Handle)
+                    if ($seenStarts.ContainsKey($child.ProcessId)) { continue }
+                    if ($seenStarts.Count -gt $MaxCount) { throw 'worktree-holder-descendants-unbounded' }
+                    $seenStarts[$child.ProcessId] = $child.StartUtc
                     $discoveredNew = $true
                     $toStop.Add($child)
                 }
