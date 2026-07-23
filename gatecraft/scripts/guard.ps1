@@ -8,6 +8,7 @@ Usage:
   guard.ps1 release --repository-root <absolute-path> --owner-token <opaque-token> --pid <positive-decimal> --process-start <canonical-UTC>
   guard.ps1 baseline --repository-root <absolute-path> --state-root <absolute-path> --baseline-id <stable-id> --owned-paths-json <JSON-array> --process-manifest-json <JSON-array>
   guard.ps1 sweep --repository-root <absolute-path> --state-root <absolute-path> --baseline-id <stable-id>
+  guard.ps1 worktree-remove --repository-root <absolute-path> --worktree-path <absolute-path> --worker-pid <positive-decimal> --worker-process-start <canonical-UTC>
 
 Canonical process timestamps use yyyy-MM-ddTHH:mm:ss.fffffffZ.
 Owner tokens use 32-128 ASCII letters, digits, underscore, or hyphen.
@@ -32,6 +33,7 @@ function Get-GuardExitCode {
     if ($Code -match '^baseline-exists$') { return 74 }
     if ($Code -match '^sweep-|^main-moved$|^foreign-change$') { return 75 }
     if ($Code -match '^process-') { return 76 }
+    if ($Code -match '^worktree-') { return 77 }
     return 65
 }
 
@@ -40,18 +42,20 @@ function Read-GuardArguments {
     if ($Tokens.Count -eq 1 -and [string]$Tokens[0] -ceq '--help') { Write-GuardUsage; exit 0 }
     if ($Tokens.Count -lt 1) { throw 'argument-command-required' }
     $command = [string]$Tokens[0]
-    if ($command -cnotin @('acquire', 'release', 'baseline', 'sweep')) { throw 'argument-command-invalid' }
+    if ($command -cnotin @('acquire', 'release', 'baseline', 'sweep', 'worktree-remove')) { throw 'argument-command-invalid' }
     $allowedByCommand = @{
         acquire = @('--repository-root', '--owner-token', '--pid', '--process-start', '--test-acquire-barrier', '--test-participant', '--test-timeout-ms')
         release = @('--repository-root', '--owner-token', '--pid', '--process-start')
         baseline = @('--repository-root', '--state-root', '--baseline-id', '--owned-paths-json', '--process-manifest-json')
         sweep = @('--repository-root', '--state-root', '--baseline-id')
+        'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start')
     }
     $requiredByCommand = @{
         acquire = @('--repository-root', '--owner-token', '--pid', '--process-start')
         release = @('--repository-root', '--owner-token', '--pid', '--process-start')
         baseline = @('--repository-root', '--state-root', '--baseline-id', '--owned-paths-json', '--process-manifest-json')
         sweep = @('--repository-root', '--state-root', '--baseline-id')
+        'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start')
     }
     $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($name in $allowedByCommand[$command]) { [void]$allowed.Add($name) }
@@ -857,6 +861,341 @@ function Invoke-BaselineSweep {
     [Console]::Out.WriteLine("GUARD_SWEEP_OK code=sweep-clean owned_changes=$ownedCount")
 }
 
+function Assert-RegisteredWorktree {
+    param([Parameter(Mandatory)][string] $RepositoryRoot, [Parameter(Mandatory)][string] $WorktreePath)
+    $listBytes = Invoke-GitBytes -RepositoryRoot $RepositoryRoot -Arguments @('worktree', 'list', '--porcelain') -FailureCode 'git-worktree-list-failed'
+    $listText = ([Text.UTF8Encoding]::new($false, $true).GetString($listBytes)) -replace "`r`n", "`n"
+    foreach ($line in @($listText -split "`n")) {
+        if (-not $line.StartsWith('worktree ', [StringComparison]::Ordinal)) { continue }
+        $candidate = $line.Substring('worktree '.Length)
+        try { $candidateFull = ConvertTo-LocalFullPath -DeclaredPath $candidate -InvalidCode 'git-output-invalid' -NonLocalCode 'git-output-invalid' }
+        catch { continue }
+        if (Test-PathEqual -Left $candidateFull -Right $WorktreePath) { return }
+    }
+    throw 'worktree-not-registered'
+}
+
+function Test-RegisteredWorktree {
+    param([Parameter(Mandatory)][string] $RepositoryRoot, [Parameter(Mandatory)][string] $WorktreePath)
+    try { Assert-RegisteredWorktree -RepositoryRoot $RepositoryRoot -WorktreePath $WorktreePath; return $true }
+    catch {
+        if ([string]$_.Exception.Message -ceq 'worktree-not-registered') { return $false }
+        throw
+    }
+}
+
+function Get-WorktreeAdminDir {
+    # Resolved once, while the worktree is still fully intact, so a later torn removal attempt
+    # (deregistered but not deleted — git worktree remove is not atomic on Windows) has a known-good
+    # admin-dir path to restore into. Never re-derived after a failed attempt: a torn worktree can no
+    # longer answer `git -C <worktree> rev-parse --git-dir` for itself.
+    param([Parameter(Mandatory)][object] $Context, [Parameter(Mandatory)][string] $WorktreePath)
+    $bytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('rev-parse', '--path-format=absolute', '--git-dir') -FailureCode 'git-worktree-admin-dir-failed'
+    $text = ConvertFrom-GitLine -Bytes $bytes -FailureCode 'git-output-invalid'
+    $full = ConvertTo-LocalFullPath -DeclaredPath $text -InvalidCode 'git-output-invalid' -NonLocalCode 'git-output-invalid'
+    $expectedParent = [IO.Path]::Combine($Context.GitCommonDir, 'worktrees')
+    if (-not (Test-PathAtOrBelow -Candidate $full -Parent $expectedParent)) { throw 'git-worktree-admin-dir-unexpected' }
+    Assert-SafePathComponents -FullPath $full -ReparseCode 'path-reparse'
+    if (-not [IO.Directory]::Exists($full)) { throw 'git-worktree-admin-dir-missing' }
+    return $full
+}
+
+function Backup-WorktreeRemovalState {
+    # A failed `git worktree remove` on Windows can tear two separate things before the locked
+    # file blocks the actual unlink: the shared admin dir (.git/worktrees/<name>) and the worktree's
+    # own `.git` marker file (which just contains `gitdir: <admin-dir>`). Both are backed up here,
+    # in memory, before every attempt, so a torn attempt can be restored to exactly its prior state.
+    param([Parameter(Mandatory)][string] $AdminDir, [Parameter(Mandatory)][string] $WorktreePath)
+    Assert-SafePathComponents -FullPath $AdminDir -ReparseCode 'path-reparse'
+    if (-not [IO.Directory]::Exists($AdminDir)) { throw 'worktree-admin-dir-missing' }
+    $files = [Collections.Generic.List[object]]::new()
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($AdminDir)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        Assert-NotReparsePoint -Path $directory -Code 'path-reparse'
+        foreach ($entry in [IO.DirectoryInfo]::new($directory).GetFileSystemInfos()) {
+            Assert-NotReparsePoint -Path $entry.FullName -Code 'path-reparse'
+            if ($entry -is [IO.DirectoryInfo]) { $pending.Push($entry.FullName) }
+            elseif ($entry -is [IO.FileInfo]) {
+                $relative = [IO.Path]::GetRelativePath($AdminDir, $entry.FullName)
+                $files.Add([pscustomobject]@{ Relative = $relative; Bytes = [IO.File]::ReadAllBytes($entry.FullName) })
+            }
+            else { throw 'worktree-admin-dir-unsupported-entry' }
+        }
+    }
+    $markerPath = [IO.Path]::Combine($WorktreePath, '.git')
+    Assert-NotReparsePoint -Path $markerPath -Code 'path-reparse'
+    if (-not [IO.File]::Exists($markerPath)) { throw 'worktree-git-marker-missing' }
+    $markerBytes = [IO.File]::ReadAllBytes($markerPath)
+    return [pscustomobject]@{ AdminFiles = @($files); MarkerBytes = $markerBytes }
+}
+
+function Restore-WorktreeRemovalState {
+    param([Parameter(Mandatory)][string] $AdminDir, [Parameter(Mandatory)][string] $WorktreePath, [Parameter(Mandatory)][object] $Backup)
+    if ([IO.Directory]::Exists($AdminDir) -or [IO.File]::Exists($AdminDir)) { throw 'worktree-admin-dir-unexpected' }
+    foreach ($file in $Backup.AdminFiles) {
+        $target = [IO.Path]::GetFullPath([IO.Path]::Combine($AdminDir, $file.Relative))
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+        [IO.File]::WriteAllBytes($target, $file.Bytes)
+    }
+    Assert-SafePathComponents -FullPath $AdminDir -ReparseCode 'path-reparse'
+    $markerPath = [IO.Path]::Combine($WorktreePath, '.git')
+    if (-not [IO.File]::Exists($markerPath)) {
+        if ([IO.Directory]::Exists($markerPath)) { throw 'worktree-git-marker-unexpected' }
+        [IO.File]::WriteAllBytes($markerPath, $Backup.MarkerBytes)
+    }
+    Assert-NotReparsePoint -Path $markerPath -Code 'path-reparse'
+}
+
+function Assert-WorktreeCleanBeforeRemoval {
+    # Called once, before the first removal attempt, while the worktree is still fully intact.
+    # A failed Windows removal attempt can itself leave the worktree looking "dirty" afterward (it can
+    # delete some tracked, unlocked files before the locked one blocks it, so git sees them as
+    # missing/modified on a later attempt) even though nothing the caller did made it genuinely dirty.
+    # Verifying real cleanliness up front, once, lets every attempt safely use `--force` afterward:
+    # `--force` only skips git's own dirty-worktree check, and this call already proved there was
+    # nothing real for that check to protect — it never bypasses the locked-file unlink itself.
+    param([Parameter(Mandatory)][string] $WorktreePath)
+    $statusBytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none') -FailureCode 'git-worktree-status-failed'
+    if ($statusBytes.Length -ne 0) { throw 'worktree-dirty' }
+}
+
+function Invoke-GitWorktreeRemoveAttempt {
+    param([Parameter(Mandatory)][string] $RepositoryRoot, [Parameter(Mandatory)][string] $WorktreePath)
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = 'git'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.WorkingDirectory = $RepositoryRoot
+    $start.Environment['GIT_OPTIONAL_LOCKS'] = '0'
+    $start.ArgumentList.Add('-C')
+    $start.ArgumentList.Add($RepositoryRoot)
+    $start.ArgumentList.Add('worktree')
+    $start.ArgumentList.Add('remove')
+    # Safe only because Assert-WorktreeCleanBeforeRemoval already proved the worktree was genuinely
+    # clean before the first attempt touched anything; --force here only skips re-checking that (which
+    # a prior failed attempt can itself have made look dirty), never the physical locked-file unlink.
+    $start.ArgumentList.Add('--force')
+    $start.ArgumentList.Add('--')
+    $start.ArgumentList.Add($WorktreePath)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { return $false }
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        [void]$outTask.GetAwaiter().GetResult()
+        [void]$errTask.GetAwaiter().GetResult()
+        return ($process.ExitCode -eq 0) -and (-not [IO.Directory]::Exists($WorktreePath))
+    }
+    catch [ComponentModel.Win32Exception] { return $false }
+    finally { $process.Dispose() }
+}
+
+function Get-TrackedRelativePaths {
+    # A cheap manifest (mode + path, no content) of every tracked entry that is actually present on disk
+    # right now, taken once via read-only `ls-files -s` while the worktree is still known-clean (right
+    # after Assert-WorktreeCleanBeforeRemoval), so a later failed attempt can be checked against it
+    # without ever having had to buffer the full worktree contents up front. The mode lets
+    # Restore-MissingTrackedFiles tell a plain file (100644/100755) apart from a symlink (120000) or a
+    # gitlink/submodule (160000) — the latter two are never safely reconstructable from a blob's raw
+    # bytes via a plain file write, so they must not be treated the same as an ordinary tracked file.
+    #
+    # Deliberately presence-based, not index-metadata-based: a tracked entry the index reports but that
+    # is not actually on disk right now (sparse checkout, the skip-worktree bit, or any other legitimate
+    # reason) is excluded from the manifest entirely, so a later repair can never synthesize back
+    # something that was never really there to begin with — it only ever restores paths this function
+    # itself observed present at the exact moment the worktree was proven clean.
+    param([Parameter(Mandatory)][string] $WorktreePath)
+    $bytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('ls-files', '-z', '-s') -FailureCode 'git-worktree-ls-files-failed'
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in @($text -split "`0")) {
+        if ($candidate.Length -eq 0) { continue }
+        if ($candidate -cnotmatch '^(?<mode>[0-7]{6}) [0-9a-f]{40,64} [0-3]\t(?<path>.+)$') { throw 'git-worktree-ls-files-failed' }
+        $relative = $Matches.path
+        [void](Assert-RepositoryRelativePath -Value $relative)
+        $full = Assert-RepositoryPathSafe -RepositoryRoot $WorktreePath -RelativePath $relative
+        if (-not [IO.File]::Exists($full) -and -not [IO.Directory]::Exists($full)) { continue }
+        $entries.Add([pscustomobject]@{ Mode = $Matches.mode; Path = $relative })
+    }
+    return @($entries)
+}
+
+function Test-AutoCrlfSafe {
+    # core.autocrlf is repository CONFIG, not a per-path attribute — when a file's `text` attribute is
+    # unspecified, Git still consults this config to decide whether checkout applies CRLF translation.
+    # A raw `git show` blob write bypasses that translation entirely, so any autocrlf setting other than
+    # the default/false makes byte-raw restore unsafe for every plain file in this worktree, not just
+    # paths with an explicit attribute — checked once, repository-wide, rather than per path.
+    param([Parameter(Mandatory)][string] $WorktreePath)
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = 'git'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.WorkingDirectory = $WorktreePath
+    $start.ArgumentList.Add('-C')
+    $start.ArgumentList.Add($WorktreePath)
+    $start.ArgumentList.Add('config')
+    $start.ArgumentList.Add('--get')
+    $start.ArgumentList.Add('core.autocrlf')
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'git-worktree-config-failed' }
+        $outTask = $process.StandardOutput.ReadToEndAsync()
+        $errTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $outTask.GetAwaiter().GetResult()
+        [void]$errTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -eq 1) { return $true }
+        if ($process.ExitCode -ne 0) { throw 'git-worktree-config-failed' }
+        return ($stdout.Trim().ToLowerInvariant() -ceq 'false')
+    }
+    catch [ComponentModel.Win32Exception] { throw 'git-worktree-config-failed' }
+    finally { $process.Dispose() }
+}
+
+function Test-SafeToAutoRestoreTrackedFile {
+    # Deliberately conservative: only a plain regular file (100644/100755) with no configured Git
+    # attribute that could transform its checked-out bytes — filter/text/eol (smudge/clean, LFS, EOL
+    # normalization), crlf (legacy alias implying text/eol), ident ($Id$ expansion), or working-tree-
+    # encoding (blob re-encoding) — is restored automatically. A symlink (120000) restored via a raw-
+    # blob file write would materialize as a regular file containing the link-target *text* instead of
+    # an actual symlink; a gitlink/submodule (160000) has no blob content at all to write. Anything
+    # outside the safe set is deliberately left alone here — Repair-WorktreeAfterFailedAttempt's final
+    # clean-status check then fails closed if it's genuinely still missing, rather than this function
+    # silently fabricating incorrect content or the wrong kind of filesystem entry.
+    param([Parameter(Mandatory)][string] $WorktreePath, [Parameter(Mandatory)][string] $RelativePath, [Parameter(Mandatory)][string] $Mode, [Parameter(Mandatory)][bool] $AutoCrlfSafe)
+    if (-not $AutoCrlfSafe) { return $false }
+    if ($Mode -cnotin @('100644', '100755')) { return $false }
+    $bytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('check-attr', 'filter', 'text', 'eol', 'crlf', 'ident', 'working-tree-encoding', '--', $RelativePath) -FailureCode 'worktree-restore-failed'
+    $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    foreach ($line in @($text -split "`n")) {
+        if ($line.Length -eq 0) { continue }
+        if ($line -cnotmatch ': (?:filter|text|eol|crlf|ident|working-tree-encoding): (?<value>.+)\r?$') { throw 'worktree-restore-failed' }
+        if ($Matches.value -cne 'unspecified') { return $false }
+    }
+    return $true
+}
+
+function Restore-MissingTrackedFiles {
+    # Production guard code must never invoke a Git mutation command (see Test-ProtocolContract.ps1's
+    # forbidden-mutations check) — restoring a tracked file a failed attempt deleted is done entirely
+    # with read-only Git plumbing (`show` for the recorded blob content) plus direct filesystem writes,
+    # never by handing Git itself a command that could rewrite the working tree wholesale.
+    param([Parameter(Mandatory)][string] $WorktreePath, [Parameter(Mandatory)][object[]] $TrackedPaths, [Parameter(Mandatory)][bool] $AutoCrlfSafe)
+    foreach ($entry in $TrackedPaths) {
+        $full = Assert-RepositoryPathSafe -RepositoryRoot $WorktreePath -RelativePath $entry.Path
+        if ([IO.File]::Exists($full) -or [IO.Directory]::Exists($full)) { continue }
+        if (-not (Test-SafeToAutoRestoreTrackedFile -WorktreePath $WorktreePath -RelativePath $entry.Path -Mode $entry.Mode -AutoCrlfSafe $AutoCrlfSafe)) { continue }
+        $blobBytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('show', "HEAD:$($entry.Path)") -FailureCode 'worktree-restore-failed'
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($full))
+        [IO.File]::WriteAllBytes($full, $blobBytes)
+    }
+}
+
+function Repair-WorktreeAfterFailedAttempt {
+    # A failed attempt can tear more than the admin dir/marker: `git worktree remove --force` can also
+    # delete other tracked-but-unlocked files before the locked one blocks it. Both callers of this
+    # function — the recover path (about to retry) and the fail-closed path (about to give up and
+    # report failure) — share the same requirement: a failed attempt must never silently report success
+    # over undetected damage, so both repair fully rather than only the caller that happens to retry.
+    #
+    # Restoring missing tracked files from their recorded blob content is safe here specifically because
+    # Assert-WorktreeCleanBeforeRemoval already proved, once, that the worktree matched HEAD exactly
+    # before the first attempt touched anything — so every difference found now was self-inflicted by a
+    # failed removal attempt, never a real caller/user change. This does not close every theoretical
+    # TOCTOU window (something could in principle change the worktree in the narrow gap between that
+    # check and an attempt), but that same narrow race exists in Git's own unforced clean-check-then-
+    # unlink sequence. Restore-MissingTrackedFiles only ever auto-heals the subset it can prove is safe
+    # (plain files with no content-transforming attribute or config); the final clean-status verification
+    # below is what actually delivers the guarantee end to end — a failed attempt either ends up fully
+    # repaired, or this throws `worktree-restore-failed` rather than reporting false success over an
+    # entry it could not safely auto-heal (a symlink, a gitlink, or a filtered/CRLF-sensitive file).
+    param([Parameter(Mandatory)][string] $RepositoryRoot, [Parameter(Mandatory)][string] $WorktreePath, [Parameter(Mandatory)][string] $AdminDir, [Parameter(Mandatory)][object] $Backup, [Parameter(Mandatory)][object[]] $TrackedPaths, [Parameter(Mandatory)][bool] $AutoCrlfSafe)
+    if (-not (Test-RegisteredWorktree -RepositoryRoot $RepositoryRoot -WorktreePath $WorktreePath)) {
+        Restore-WorktreeRemovalState -AdminDir $AdminDir -WorktreePath $WorktreePath -Backup $Backup
+        if (-not (Test-RegisteredWorktree -RepositoryRoot $RepositoryRoot -WorktreePath $WorktreePath)) { throw 'worktree-restore-failed' }
+    }
+    Restore-MissingTrackedFiles -WorktreePath $WorktreePath -TrackedPaths $TrackedPaths -AutoCrlfSafe $AutoCrlfSafe
+    $statusBytes = Invoke-GitBytes -RepositoryRoot $WorktreePath -Arguments @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none') -FailureCode 'worktree-restore-failed'
+    if ($statusBytes.Length -ne 0) { throw 'worktree-restore-failed' }
+}
+
+function Invoke-GuardedWorktreeRemoveAttempt {
+    # git worktree remove is not atomic on Windows: it can deregister the worktree from the admin
+    # dir (.git/worktrees/<name>), delete its own `.git` marker file, and/or delete other tracked-but-
+    # unlocked files, all before a locked file blocks the actual directory deletion — leaving a torn
+    # state. Every attempt backs up the admin dir and marker first; on failure, Repair-WorktreeAfterFailedAttempt
+    # either fully restores the worktree to its exact starting state or fails this closed — never both
+    # reporting failure and leaving partial damage behind.
+    param([Parameter(Mandatory)][string] $RepositoryRoot, [Parameter(Mandatory)][string] $WorktreePath, [Parameter(Mandatory)][string] $AdminDir, [Parameter(Mandatory)][object[]] $TrackedPaths, [Parameter(Mandatory)][bool] $AutoCrlfSafe)
+    $backup = Backup-WorktreeRemovalState -AdminDir $AdminDir -WorktreePath $WorktreePath
+    if (Invoke-GitWorktreeRemoveAttempt -RepositoryRoot $RepositoryRoot -WorktreePath $WorktreePath) { return $true }
+    if (-not [IO.Directory]::Exists($WorktreePath)) { return $false }
+    Repair-WorktreeAfterFailedAttempt -RepositoryRoot $RepositoryRoot -WorktreePath $WorktreePath -AdminDir $AdminDir -Backup $backup -TrackedPaths $TrackedPaths -AutoCrlfSafe $AutoCrlfSafe
+    return $false
+}
+
+function Invoke-WorktreeRemove {
+    param([object] $Context, [Collections.Generic.Dictionary[string,string]] $Options)
+    $worktreePath = ConvertTo-LocalFullPath -DeclaredPath $Options['--worktree-path'] -InvalidCode 'worktree-path-invalid' -NonLocalCode 'worktree-path-nonlocal'
+    Assert-SafePathComponents -FullPath $worktreePath -ReparseCode 'path-reparse'
+    if (Test-PathEqual -Left $worktreePath -Right $Context.RepositoryRoot) { throw 'worktree-path-invalid' }
+    $workerPid = ConvertTo-PositivePid -Value $Options['--worker-pid']
+    $workerStart = ConvertTo-CanonicalProcessStart -Value $Options['--worker-process-start']
+
+    Assert-RegisteredWorktree -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath
+    if (-not [IO.Directory]::Exists($worktreePath)) { throw 'worktree-path-missing' }
+    Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
+    $adminDir = Get-WorktreeAdminDir -Context $Context -WorktreePath $worktreePath
+    $trackedPaths = Get-TrackedRelativePaths -WorktreePath $worktreePath
+    $autoCrlfSafe = Test-AutoCrlfSafe -WorktreePath $worktreePath
+
+    # The declared worker's liveness must be resolved BEFORE any removal attempt, never inferred from
+    # whether that attempt happened to succeed. A live worker can hold no blocking handle on this
+    # worktree at the exact instant removal runs (its CWD is elsewhere, or its I/O is idle) — a first
+    # attempt that succeeds anyway must never be read as proof the worker is gone (lived: found by
+    # external review round 6 — the prior order checked/killed the declared PID only after a failed
+    # first attempt, so a live-but-non-blocking worker survived a "clean" removal as an orphan process).
+    # Only a binding state confirmed not 'ok' (already dead, or the PID was reused by something
+    # unrelated) — or a live holder this call itself just stopped and re-confirmed dead — may be
+    # followed by declaring the worktree removed. Never discover "who else" might be locking it and
+    # never touch any process but the exact declared one.
+    $mode = "clean"
+    $state = Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart
+    if ($state -ceq 'ok') {
+        $process = $null
+        try {
+            $process = [Diagnostics.Process]::GetProcessById($workerPid)
+            $process.Kill($true)
+            [void]$process.WaitForExit(5000)
+        }
+        catch [ArgumentException] { }
+        finally { if ($null -ne $process) { $process.Dispose() } }
+        if ((Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart) -cne 'process-dead') { throw 'worktree-holder-alive' }
+        $mode = 'recovered'
+    }
+
+    if (Invoke-GuardedWorktreeRemoveAttempt -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath -AdminDir $adminDir -TrackedPaths $trackedPaths -AutoCrlfSafe $autoCrlfSafe) {
+        [Console]::Out.WriteLine("GUARD_WORKTREE_REMOVED code=worktree-removed mode=$mode")
+        return
+    }
+    if (-not [IO.Directory]::Exists($worktreePath)) { throw 'worktree-remove-failed' }
+
+    # A real, undeclared blocker (never the declared worker — that was already resolved above) can still
+    # hold the directory open; one retry covers a handle released asynchronously between attempts.
+    if (-not (Invoke-GuardedWorktreeRemoveAttempt -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath -AdminDir $adminDir -TrackedPaths $trackedPaths -AutoCrlfSafe $autoCrlfSafe)) { throw 'worktree-remove-failed' }
+    [Console]::Out.WriteLine('GUARD_WORKTREE_REMOVED code=worktree-removed mode=recovered')
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 7) { Stop-Guard -ExitCode 64 -Code 'powershell-version' }
 
 try {
@@ -869,6 +1208,7 @@ try {
         'release' { Invoke-LockRelease -Context $context -Options $parsed.Values }
         'baseline' { Invoke-BaselineCreate -Context $context -Options $parsed.Values }
         'sweep' { Invoke-BaselineSweep -Context $context -Options $parsed.Values }
+        'worktree-remove' { Invoke-WorktreeRemove -Context $context -Options $parsed.Values }
     }
     exit 0
 }

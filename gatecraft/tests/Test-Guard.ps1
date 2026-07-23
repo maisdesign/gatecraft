@@ -99,6 +99,33 @@ function Get-CanonicalStart {
     return $Process.StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Start-WorktreeHolder {
+    param([Parameter(Mandatory)][string] $WorktreePath)
+    # Hold a read handle on a file already committed in the worktree (never a new/modified one) with
+    # FileShare.Read: this permits git's own status/clean check to read the file (so git proceeds past
+    # that check into the actual removal, matching the real-world torn-state scenario) while still
+    # denying the FILE_SHARE_DELETE every other handle needs, so the final unlink still fails and
+    # blocks git's own removal deterministically. FileShare.None looks stricter but is wrong for this
+    # fixture: it blocks git's own read during the clean check too, so git refuses up front with
+    # "contains modified or untracked files" before ever touching worktree registration or the admin
+    # dir — a clean early refusal that never exercises the torn-state restore path this suite exists
+    # to validate.
+    $lockedFile = Join-Path $WorktreePath 'owned.txt'
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $pwshPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.WorkingDirectory = $WorktreePath
+    $info.Environment['GATECRAFT_TEST_HOLDER_PATH'] = $lockedFile
+    $info.ArgumentList.Add('-NoLogo')
+    $info.ArgumentList.Add('-NoProfile')
+    $info.ArgumentList.Add('-Command')
+    $info.ArgumentList.Add('$stream = [IO.File]::Open($env:GATECRAFT_TEST_HOLDER_PATH, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read); Start-Sleep -Seconds 300')
+    $process = [Diagnostics.Process]::Start($info)
+    $children.Add($process)
+    return $process
+}
+
 function New-GuardStartInfo {
     param([string] $Surface, [string[]] $Arguments, [bool] $TestControls)
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -559,6 +586,77 @@ try {
     $indexBlocked = Invoke-Guard -Arguments (New-SweepArguments -Repository $indexRepo -StateRoot $indexState -BaselineId indexdirty)
     Assert-True ($indexBlocked.ExitCode -ne 0 -and $indexBlocked.Error -match 'code=foreign-change') 'Changed index bytes under identical status/worktree bytes must block.'
 
+    if ($onWindows) {
+        # worktree-remove recovers when the exact declared worker (--worker-pid/--worker-process-start) is
+        # still holding the worktree directory open (its own file handle) at the moment removal is
+        # attempted — guard.ps1 trusts only that declared PID+start-time as the holder, stops it, and retries.
+        $wtRecoverRepo = New-TestRepository 'worktree-remove-recover-repo'
+        $wtRecoverPath = Join-Path $testRoot 'worktree-remove-recover-wt'
+        Invoke-Git $wtRecoverRepo worktree add $wtRecoverPath -b wt-recover-branch | Out-Null
+        $wtRecoverHolder = Start-WorktreeHolder -WorktreePath $wtRecoverPath
+        $wtRecoverHolderStart = Get-CanonicalStart $wtRecoverHolder
+        # Do not probe with a separate manual `git worktree remove` first: a failed attempt can already
+        # unlink the worktree's own files before failing on the directory itself, and this command's own
+        # first internal attempt must be the only attempt made against a still-fully-registered worktree.
+        $recoverResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtRecoverRepo,'--worktree-path',$wtRecoverPath,'--worker-pid',([string]$wtRecoverHolder.Id),'--worker-process-start',$wtRecoverHolderStart) -TimeoutMilliseconds 30000
+        Assert-Equal $recoverResult.ExitCode 0 "Worktree-remove must recover once its own fallback stops the exact declared holder. stdout=$($recoverResult.Output) stderr=$($recoverResult.Error)"
+        Assert-True ($recoverResult.Output -match 'mode=recovered') 'A live CWD holder must force the fallback path (mode=recovered), proving the fixture actually blocked the first attempt.'
+        Assert-True (-not [IO.Directory]::Exists($wtRecoverPath)) 'Recovered worktree-remove must actually delete the directory.'
+        Assert-True $wtRecoverHolder.HasExited 'Recovered worktree-remove must have stopped the exact declared holder.'
+        # git worktree list --porcelain always emits forward-slash paths regardless of platform;
+        # Join-Path on Windows emits backslashes, so compare against the forward-slash form or this
+        # never matches either way regardless of the real registration state.
+        $registeredAfterRecover = (& git -C $wtRecoverRepo worktree list --porcelain) -join "`n"
+        Assert-True (-not $registeredAfterRecover.Contains($wtRecoverPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Recovered worktree-remove must unregister the worktree from git.'
+
+        # worktree-remove must stop the exact declared worker even when it holds no blocking handle at
+        # all — no locked file, no CWD inside the worktree — so a first removal attempt would otherwise
+        # succeed by luck while the worker is still alive. Success must never be inferred from an
+        # unopposed first attempt; the declared PID's liveness must be resolved independently every time
+        # (lived: found by external review round 6, 2026-07-23 — the prior implementation only
+        # checked/killed the declared worker after a failed first attempt).
+        $wtLiveNonBlockingRepo = New-TestRepository 'worktree-remove-live-nonblocking-repo'
+        $wtLiveNonBlockingPath = Join-Path $testRoot 'worktree-remove-live-nonblocking-wt'
+        Invoke-Git $wtLiveNonBlockingRepo worktree add $wtLiveNonBlockingPath -b wt-live-nonblocking-branch | Out-Null
+        $wtLiveNonBlockingWorker = Start-TestSleeper
+        $wtLiveNonBlockingWorkerStart = Get-CanonicalStart $wtLiveNonBlockingWorker
+        $liveNonBlockingResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtLiveNonBlockingRepo,'--worktree-path',$wtLiveNonBlockingPath,'--worker-pid',([string]$wtLiveNonBlockingWorker.Id),'--worker-process-start',$wtLiveNonBlockingWorkerStart) -TimeoutMilliseconds 30000
+        Assert-Equal $liveNonBlockingResult.ExitCode 0 "Worktree-remove must succeed once the live-but-nonblocking declared worker is stopped. stdout=$($liveNonBlockingResult.Output) stderr=$($liveNonBlockingResult.Error)"
+        Assert-True ($liveNonBlockingResult.Output -match 'mode=recovered') 'A live declared worker must always be stopped before success is reported, even when nothing blocked the first removal attempt (mode=recovered).'
+        Assert-True (-not [IO.Directory]::Exists($wtLiveNonBlockingPath)) 'Worktree-remove must actually delete the directory.'
+        Assert-True $wtLiveNonBlockingWorker.HasExited 'Worktree-remove must have stopped the declared worker even though it held no blocking handle.'
+        $registeredAfterLiveNonBlocking = (& git -C $wtLiveNonBlockingRepo worktree list --porcelain) -join "`n"
+        Assert-True (-not $registeredAfterLiveNonBlocking.Contains($wtLiveNonBlockingPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Worktree-remove must unregister the worktree from git.'
+
+        # worktree-remove fails closed, and touches nothing, when the declared worker's binding state does
+        # not verify as the live holder (here: it has already exited) — it must never go looking for who
+        # else might be holding the directory open, and must never touch any process but the declared one
+        # (anti-patterns.md). A real, still-live process keeps the directory locked throughout, so the only
+        # way this can succeed is if guard.ps1 (wrongly) went looking for some other holder to kill.
+        $wtFailClosedRepo = New-TestRepository 'worktree-remove-fail-closed-repo'
+        $wtFailClosedPath = Join-Path $testRoot 'worktree-remove-fail-closed-wt'
+        Invoke-Git $wtFailClosedRepo worktree add $wtFailClosedPath -b wt-fail-closed-branch | Out-Null
+        $wtFailClosedActualHolder = Start-WorktreeHolder -WorktreePath $wtFailClosedPath
+        $wtFailClosedDeadWorker = Start-TestSleeper
+        $wtFailClosedDeadStart = Get-CanonicalStart $wtFailClosedDeadWorker
+        $wtFailClosedDeadWorker.Kill($true)
+        $wtFailClosedDeadWorker.WaitForExit()
+        $failClosedResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtFailClosedRepo,'--worktree-path',$wtFailClosedPath,'--worker-pid',([string]$wtFailClosedDeadWorker.Id),'--worker-process-start',$wtFailClosedDeadStart) -TimeoutMilliseconds 30000
+        Assert-True ($failClosedResult.ExitCode -ne 0 -and $failClosedResult.Error -match 'code=worktree-remove-failed') "A declared worker whose binding state is not 'ok' must fail closed. stderr=$($failClosedResult.Error)"
+        Assert-True ([IO.Directory]::Exists($wtFailClosedPath)) 'Fail-closed worktree-remove must not delete the directory.'
+        Assert-True (-not $wtFailClosedActualHolder.HasExited) 'Fail-closed worktree-remove must not kill the real, undeclared holder.'
+        $registeredFailClosed = (& git -C $wtFailClosedRepo worktree list --porcelain) -join "`n"
+        Assert-True $registeredFailClosed.Contains($wtFailClosedPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase) 'Fail-closed worktree-remove must leave the worktree registered.'
+        # "Touches nothing" must be verified directly, not inferred from directory-exists/registered
+        # alone: a failed remove attempt can delete other tracked-but-unlocked files (e.g. foreign.txt)
+        # before the locked one blocks it, which neither of those checks would catch.
+        Assert-True ([IO.File]::Exists((Join-Path $wtFailClosedPath 'foreign.txt'))) 'Fail-closed worktree-remove must not delete unlocked tracked files.'
+        $failClosedStatus = (& git -C $wtFailClosedPath status --porcelain=v1) -join "`n"
+        Assert-True ([string]::IsNullOrEmpty($failClosedStatus)) "Fail-closed worktree-remove must leave the tracked tree exactly clean. status=$failClosedStatus"
+        # $wtFailClosedActualHolder is left alive here; the top-level finally block stops every spawned
+        # child before the temp root is force-removed.
+    }
+
     # A junction/symlink at the fixed guard directory is rejected before target mutation.
     $reparseRepo = New-TestRepository 'reparse-repo'
     $reparseOwner = Start-TestSleeper
@@ -578,7 +676,7 @@ try {
     Assert-True (-not [IO.File]::Exists((Join-Path $externalTarget 'holder.json'))) 'Reparse rejection must not create an external holder.'
 
     if (-not [string]::IsNullOrEmpty($bashEnvironmentFailure)) { throw $bashEnvironmentFailure }
-    Write-Host 'Guard gate passed: concurrent lock, owner release, ordinal culture determinism, foreign sweep, process binding, dirty-byte hashing, shell parity, and reparse rejection are green.'
+    Write-Host 'Guard gate passed: concurrent lock, owner release, ordinal culture determinism, foreign sweep, process binding, dirty-byte hashing, shell parity, worktree-remove fallback, and reparse rejection are green.'
 }
 finally {
     foreach ($process in $children) {
