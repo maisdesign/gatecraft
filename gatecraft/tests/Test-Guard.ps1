@@ -126,6 +126,52 @@ function Start-WorktreeHolder {
     return $process
 }
 
+function Start-ProcessTreeWorker {
+    # Spawns a "root" process that is the declared worker (--worker-pid), whose own script in turn
+    # starts one real OS child process -- so a ParentProcessId walk from the declared PID has an actual
+    # descendant to discover, matching external review round 12's exact scenario: a worker whose
+    # already-spawned child, not the worker itself, is what could still touch the worktree after the
+    # worker is stopped. The child sleeps for a long, fixed delay before writing $TargetFile -- long
+    # enough that if guard.ps1's descendant sweep works, the child is confirmed dead well before that
+    # delay could ever elapse, making "the write never happened" a deterministic assertion rather than a
+    # race against wall-clock timing. The child-spawning logic lives in its own file (rather than a
+    # string embedded in the root process's own -Command argument) purely to avoid three levels of
+    # nested PowerShell string-escaping; it carries no other significance.
+    param([Parameter(Mandatory)][string] $TargetFile, [Parameter(Mandatory)][string] $ChildPidFile)
+    $rootScriptPath = Join-Path $testRoot 'process-tree-worker-root.ps1'
+    if (-not [IO.File]::Exists($rootScriptPath)) {
+        $rootScript = @'
+$childInfo = [Diagnostics.ProcessStartInfo]::new()
+$childInfo.FileName = $env:GATECRAFT_TEST_PWSH_PATH
+$childInfo.UseShellExecute = $false
+$childInfo.CreateNoWindow = $true
+$childInfo.Environment['GATECRAFT_TEST_TARGET_FILE'] = $env:GATECRAFT_TEST_TARGET_FILE
+$childInfo.ArgumentList.Add('-NoLogo')
+$childInfo.ArgumentList.Add('-NoProfile')
+$childInfo.ArgumentList.Add('-Command')
+$childInfo.ArgumentList.Add('Start-Sleep -Seconds 300; [IO.File]::WriteAllText($env:GATECRAFT_TEST_TARGET_FILE, "descendant-wrote`n")')
+$child = [Diagnostics.Process]::Start($childInfo)
+[IO.File]::WriteAllText($env:GATECRAFT_TEST_CHILD_PID_FILE, [string]$child.Id)
+Start-Sleep -Seconds 300
+'@
+        [IO.File]::WriteAllText($rootScriptPath, $rootScript, $utf8)
+    }
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $pwshPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.Environment['GATECRAFT_TEST_PWSH_PATH'] = $pwshPath
+    $info.Environment['GATECRAFT_TEST_TARGET_FILE'] = $TargetFile
+    $info.Environment['GATECRAFT_TEST_CHILD_PID_FILE'] = $ChildPidFile
+    $info.ArgumentList.Add('-NoLogo')
+    $info.ArgumentList.Add('-NoProfile')
+    $info.ArgumentList.Add('-File')
+    $info.ArgumentList.Add($rootScriptPath)
+    $root = [Diagnostics.Process]::Start($info)
+    $children.Add($root)
+    return $root
+}
+
 function New-GuardStartInfo {
     param([string] $Surface, [string[]] $Arguments, [bool] $TestControls)
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -627,6 +673,39 @@ try {
         Assert-True $wtLiveNonBlockingWorker.HasExited 'Worktree-remove must have stopped the declared worker even though it held no blocking handle.'
         $registeredAfterLiveNonBlocking = (& git -C $wtLiveNonBlockingRepo worktree list --porcelain) -join "`n"
         Assert-True (-not $registeredAfterLiveNonBlocking.Contains($wtLiveNonBlockingPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Worktree-remove must unregister the worktree from git.'
+
+        # worktree-remove must stop not only the exact declared worker but any process it already spawned
+        # before its own termination. TerminateProcess never implicitly kills a process's children on
+        # Windows (there is no Job Object here to make that atomic), so a live child — its own CWD
+        # elsewhere, holding no blocking handle — could otherwise survive the declared worker's death and
+        # still write a tracked change before exiting on its own: the exact same data loss this bead exists
+        # to close, just one process generation down (lived: found by external review round 12). The
+        # fixture's child sleeps for a long fixed delay before it would ever write, so a successful,
+        # mode=recovered removal is deterministic proof the descendant sweep found and stopped it first —
+        # not a race against whether the write happened to land before the assertion ran.
+        $wtDescendantRepo = New-TestRepository 'worktree-remove-descendant-repo'
+        $wtDescendantPath = Join-Path $testRoot 'worktree-remove-descendant-wt'
+        Invoke-Git $wtDescendantRepo worktree add $wtDescendantPath -b wt-descendant-branch | Out-Null
+        $descendantTargetFile = Join-Path $wtDescendantPath 'owned.txt'
+        $descendantChildPidFile = Join-Path $testRoot 'descendant-child-pid.txt'
+        $descendantRoot = Start-ProcessTreeWorker -TargetFile $descendantTargetFile -ChildPidFile $descendantChildPidFile
+        $descendantRootStart = Get-CanonicalStart $descendantRoot
+        $descendantChildWaitDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not [IO.File]::Exists($descendantChildPidFile) -and [DateTime]::UtcNow -lt $descendantChildWaitDeadline) { Start-Sleep -Milliseconds 50 }
+        Assert-True ([IO.File]::Exists($descendantChildPidFile)) 'Process-tree fixture must confirm its child actually started before worktree-remove is attempted.'
+        $descendantChildPid = [int]([IO.File]::ReadAllText($descendantChildPidFile).Trim())
+        $descendantChild = [Diagnostics.Process]::GetProcessById($descendantChildPid)
+        Assert-True (-not $descendantChild.HasExited) 'Process-tree fixture child must still be alive before worktree-remove runs.'
+        $descendantResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtDescendantRepo,'--worktree-path',$wtDescendantPath,'--worker-pid',([string]$descendantRoot.Id),'--worker-process-start',$descendantRootStart) -TimeoutMilliseconds 30000
+        Assert-Equal $descendantResult.ExitCode 0 "Worktree-remove must succeed once the declared worker's own child descendant is also stopped. stdout=$($descendantResult.Output) stderr=$($descendantResult.Error)"
+        Assert-True ($descendantResult.Output -match 'mode=recovered') 'Stopping a live descendant must still report mode=recovered like stopping the declared worker itself.'
+        Assert-True (-not [IO.Directory]::Exists($wtDescendantPath)) 'Worktree-remove must actually delete the directory once the whole descendant tree is stopped.'
+        $descendantChild.Refresh()
+        Assert-True $descendantChild.HasExited "Worktree-remove must have stopped the declared worker's child descendant, not only the declared PID."
+        Assert-True $descendantRoot.HasExited 'Worktree-remove must have stopped the declared root worker.'
+        $registeredAfterDescendant = (& git -C $wtDescendantRepo worktree list --porcelain) -join "`n"
+        Assert-True (-not $registeredAfterDescendant.Contains($wtDescendantPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Worktree-remove must unregister the worktree from git.'
+        $descendantChild.Dispose()
 
         # worktree-remove fails closed, and touches nothing, when the declared worker's binding state does
         # not verify as the live holder (here: it has already exited) — it must never go looking for who

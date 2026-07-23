@@ -314,6 +314,137 @@ function Assert-LiveProcessBinding {
     if ($state -cne 'ok') { throw $state }
 }
 
+function Get-ChildProcessRecords {
+    # Win32_Process.ParentProcessId is a live, single-level snapshot: a caller enumerating the whole
+    # tree must walk it repeatedly (see Stop-DescendantProcesses) since a child discovered here can
+    # itself spawn a further child between this call and the next. Each CIM row is independently
+    # re-validated against a freshly-opened handle to the same PID -- and specifically against the
+    # creation time WMI itself reported for that PID, not merely "whichever process currently owns that
+    # PID" -- so a PID that exited and was reused by an unrelated process in the gap between the CIM
+    # query and this call is never mistaken for the child WMI actually saw a moment ago. The comparison
+    # is tick-level (well under one WMI-reportable microsecond), not a multi-second tolerance: confirmed
+    # empirically that WMI's CreationDate and .NET's Process.StartTime for the exact same, never-reused
+    # process differ only by representation rounding within that one microsecond (WMI's DMTF datetime
+    # carries microsecond precision; StartTime carries the OS's full 100ns-tick FILETIME) -- a genuine
+    # PID-reuse gap is measured in whole process lifecycles, not ticks, so a sub-microsecond threshold
+    # still catches real reuse while absorbing only that representation noise (lived: found by external
+    # review round 14 -- the first fix used a 2-second tolerance, wide enough to itself authenticate a
+    # reused PID).
+    #
+    # A CIM row with no CreationDate at all is not skipped as if absent: a live descendant WMI genuinely
+    # reported but could not fully describe is exactly the kind of state this project's "unverifiable
+    # fails closed" standard exists for (matching Get-ProcessBindingState's own `process-unverifiable`
+    # handling for the declared root) -- treating it as "not there" would let a real survivor go
+    # undetected by both discovery and the final confirmation pass, which both call this same function
+    # (lived: found by external review round 14).
+    #
+    # $MinimumStart bounds ancestry, not just PID-reuse-in-the-moment: a numeric ParentProcessId match
+    # alone does not prove the discovered process is actually a descendant of the caller's intended
+    # lineage -- a long-dead, wholly unrelated ancestor process could have held this exact PID number
+    # long before it was ever reassigned to the declared worker's own lineage, leaving behind a live
+    # child that still reports the same numeric ParentProcessId purely by coincidence of PID reuse
+    # (lived: found by external review round 14). A real child can never have been created before its
+    # true parent, so any candidate whose own creation time predates $MinimumStart (the queried parent's
+    # own validated creation time) is rejected as ancestry-unrelated rather than trusted on PID match alone.
+    param([Parameter(Mandatory)][int] $ParentProcessId, [Parameter(Mandatory)][DateTime] $MinimumStart)
+    try {
+        $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction Stop)
+    }
+    catch { throw 'worktree-holder-descendant-unverifiable' }
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($row in $rows) {
+        if ($null -eq $row.CreationDate) { throw 'worktree-holder-descendant-unverifiable' }
+        $childPid = [int]$row.ProcessId
+        $process = $null
+        try {
+            $process = [Diagnostics.Process]::GetProcessById($childPid)
+            if ($process.HasExited) { continue }
+            $actualStartUtc = $process.StartTime.ToUniversalTime()
+            $deltaTicks = [Math]::Abs(($row.CreationDate.ToUniversalTime() - $actualStartUtc).Ticks)
+            if ($deltaTicks -ge 10) { continue }
+            if ($actualStartUtc -lt $MinimumStart) { continue }
+            $records.Add([pscustomobject]@{ ProcessId = $childPid; Start = (Get-ProcessCanonicalStart -Process $process); StartUtc = $actualStartUtc })
+        }
+        catch [ArgumentException] { continue }
+        catch { throw 'worktree-holder-descendant-unverifiable' }
+        finally { if ($null -ne $process) { $process.Dispose() } }
+    }
+    return ,$records.ToArray()
+}
+
+function Stop-DescendantProcesses {
+    # Sweeps and stops a declared root PID's entire descendant tree, then confirms none remain. Runs
+    # unconditionally against $RootProcessId regardless of the declared worker's own binding state --
+    # Windows never revokes a live child's historical ParentProcessId when its parent exits, so a worker
+    # already dead before this call (state != 'ok') can still have left live children behind, and skipping
+    # this sweep in that case would let them survive to the clean snapshot untouched (lived: found by
+    # external review round 13).
+    #
+    # A per-pass restart from the root alone is not enough: once an intermediary node (say C, a child of
+    # the root) is itself stopped, Win32_Process's ParentProcessId enumeration can no longer reach it by
+    # querying the root's current children -- C no longer appears there at all. But any of C's own live
+    # children still correctly report ParentProcessId=C's old PID regardless of whether C itself is alive,
+    # so as long as this function keeps re-querying children of every PID it has EVER seen in this sweep
+    # (not just the ones still alive), a live grandchild whose only path from the root ran through a node
+    # THIS FUNCTION ITSELF stopped in an earlier pass is never lost.
+    #
+    # KNOWN RESIDUAL GAP (documented, not fixed -- confirmed real by external review round 13 and by a
+    # direct repro): this only helps for an intermediary this sweep has already observed alive at least
+    # once. If C exits ON ITS OWN before this function's very first query ever runs (e.g. a worker that
+    # spawns a short-lived relay process which itself spawns a longer-lived one, then exits immediately),
+    # this sweep never learns C's PID existed at all, so C's own live children (like G) are permanently
+    # unreachable via ParentProcessId chaining -- there is no record anywhere of "G's parent used to be
+    # C" once Win32_Process stops listing C, because it only ever lists currently-alive processes. No
+    # pure application-level fix closes this: it needs a Windows Job Object assigned to the worker at
+    # spawn time (TerminateJobObject kills every process ever added to the job, including ones already
+    # dead-and-delinked from live enumeration) -- a change to how workers are launched, not to this
+    # function. Accepted as a known, narrower guarantee rather than blocking on an architecture change
+    # that reaches outside guard.ps1.
+    param([Parameter(Mandatory)][int] $RootProcessId, [Parameter(Mandatory)][string] $RootStart, [Parameter(Mandatory)][int] $MaxCount, [Parameter(Mandatory)][int] $MaxPasses)
+    # Maps each known PID in this sweep to its own validated creation time (the root's caller-declared
+    # start, or a discovered descendant's own WMI/GetProcessById-cross-checked start) -- this is the lower
+    # bound passed to Get-ChildProcessRecords when querying that PID's own children, so a numeric
+    # ParentProcessId match alone is never enough to trust a candidate as a real descendant (see
+    # Get-ChildProcessRecords' own comment on the ancestry-confusion gap this closes).
+    $seenStarts = [Collections.Generic.Dictionary[int, DateTime]]::new()
+    $rootStartUtc = [DateTime]::Parse($RootStart, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+    $seenStarts[$RootProcessId] = $rootStartUtc
+    $stoppedAny = $false
+    for ($pass = 0; $pass -lt $MaxPasses; $pass++) {
+        $discoveredNew = $false
+        $toStop = [Collections.Generic.List[object]]::new()
+        foreach ($knownPid in @($seenStarts.Keys)) {
+            $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
+            foreach ($child in $children) {
+                if ($seenStarts.ContainsKey($child.ProcessId)) { continue }
+                if ($seenStarts.Count -gt $MaxCount) { throw 'worktree-holder-descendants-unbounded' }
+                $seenStarts[$child.ProcessId] = $child.StartUtc
+                $discoveredNew = $true
+                $toStop.Add($child)
+            }
+        }
+        foreach ($descendant in $toStop) {
+            Stop-DeclaredWorktreeWorker -ProcessId $descendant.ProcessId -ExpectedStart $descendant.Start
+            $stoppedAny = $true
+        }
+        if (-not $discoveredNew) { break }
+    }
+    # Final confirmation: re-query children of every PID ever seen in this sweep, including ones already
+    # stopped -- a dead intermediary's own children are still reachable this way (see comment above), so
+    # this is a real convergence check, not merely re-checking the root.
+    foreach ($knownPid in @($seenStarts.Keys)) {
+        # Assign to a variable before checking .Count -- wrapping the call directly in @(...) instead
+        # would double-wrap Get-ChildProcessRecords' own comma-protected return (a single pipeline object
+        # that already *is* the array) into a length-1 array containing that array, making .Count always
+        # effectively 1 regardless of the real record count. See the two other array-unrolling pitfalls
+        # already documented on Get-ChildProcessRecords/its callers; this is the same class of mistake in
+        # the opposite direction (over-wrapping instead of under-wrapping).
+        $remaining = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
+        if ($remaining.Count -gt 0) { throw 'worktree-holder-descendant-alive' }
+    }
+    return $stoppedAny
+}
+
 function ConvertTo-CanonicalJson {
     param([Parameter(Mandatory)][object] $Value, [int] $Depth = 8)
     return ConvertTo-Json -InputObject $Value -Depth $Depth -Compress -EscapeHandling EscapeNonAscii
@@ -1214,26 +1345,35 @@ function Invoke-WorktreeRemove {
 
     Assert-RegisteredWorktree -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath
     if (-not [IO.Directory]::Exists($worktreePath)) { throw 'worktree-path-missing' }
-    Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
-    $adminDir = Get-WorktreeAdminDir -Context $Context -WorktreePath $worktreePath
-    $trackedPaths = Get-TrackedRelativePaths -WorktreePath $worktreePath
-    $autoCrlfSafe = Test-AutoCrlfSafe -WorktreePath $worktreePath
 
-    # The declared worker's liveness must be resolved BEFORE any removal attempt, never inferred from
-    # whether that attempt happened to succeed. A live worker can hold no blocking handle on this
-    # worktree at the exact instant removal runs (its CWD is elsewhere, or its I/O is idle) — a first
-    # attempt that succeeds anyway must never be read as proof the worker is gone (lived: found by
-    # external review round 6 — the prior order checked/killed the declared PID only after a failed
-    # first attempt, so a live-but-non-blocking worker survived a "clean" removal as an orphan process).
-    # Only a binding state confirmed not 'ok' (already dead, or the PID was reused by something
-    # unrelated) — or a live holder this call itself just stopped and re-confirmed dead — may be
-    # followed by declaring the worktree removed. Never discover "who else" might be locking it and
-    # never touch any process but the exact declared one. `process-unverifiable` proves nothing — the
-    # declared worker could still be alive and holding this worktree — so it must fail closed rather
-    # than being treated like a confirmed-dead/mismatched PID (lived: found by external review round 7).
+    # The declared worker's liveness must be resolved, and the worker actually stopped if still alive,
+    # BEFORE taking any "clean" snapshot of the worktree (Assert-WorktreeCleanBeforeRemoval and
+    # Get-TrackedRelativePaths below) — that snapshot is what the eventual `--force` removal trusts as
+    # ground truth. Snapshotting first and only resolving the worker afterward (the order this function
+    # used through round 10) leaves a window where a still-running declared worker can legitimately write
+    # to a tracked file after the snapshot but before its own termination, and the forced removal would
+    # then silently discard that write along with the rest of the worktree (lived: found by external
+    # review round 11, reproduced with a worker that wrote a tracked file after the clean check but before
+    # termination — guard reported mode=recovered/exit=0 and the write was gone). Resolving the worker
+    # first means the snapshot below can only ever observe a worktree no longer being written to by the
+    # one process this command is allowed to touch: a genuinely dirty tree at that point is a real
+    # pre-existing or in-flight change unrelated to the declared worker's own shutdown, and correctly
+    # fails closed via Assert-WorktreeCleanBeforeRemoval's normal `worktree-dirty` rather than being
+    # silently force-deleted.
+    #
+    # A live worker can hold no blocking handle on this worktree at the exact instant removal runs (its
+    # CWD is elsewhere, or its I/O is idle) — a first removal attempt that succeeds anyway must never be
+    # read as proof the worker is gone (lived: found by external review round 6). Only a binding state
+    # confirmed not 'ok' (already dead, or the PID was reused by something unrelated) — or a live holder
+    # this call itself just stopped and re-confirmed dead — may be followed by taking the clean snapshot
+    # and declaring the worktree removed. Never discover "who else" might be locking it and never touch
+    # any process but the exact declared one. `process-unverifiable` proves nothing — the declared worker
+    # could still be alive and holding this worktree — so it must fail closed rather than being treated
+    # like a confirmed-dead/mismatched PID (lived: found by external review round 7).
     $mode = "clean"
     $state = Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart
     if ($state -ceq 'process-unverifiable') { throw 'worktree-holder-unverifiable' }
+    $rootStopped = $false
     if ($state -ceq 'ok') {
         # Stop the exact declared worker through one native handle opened with only the rights this needs
         # (see Stop-DeclaredWorktreeWorker) -- not .NET's Process.Handle/SafeHandle, whose implicit
@@ -1241,10 +1381,31 @@ function Invoke-WorktreeRemove {
         # even though the narrow rights actually needed here are granted (lived: found by external review
         # round 9, after round 8 closed a PID-reuse TOCTOU by forcing SafeHandle but introduced this
         # access-rights regression). The re-check below is what actually decides pass/fail either way.
+        # Stopped first, before touching any descendant: TerminateProcess never implicitly kills a
+        # process's children on Windows (there is no Job Object here to make that atomic), so a live
+        # child could otherwise go on spawning further children indefinitely. Killing the root here first
+        # means it can never start another one — every descendant left after this point already existed
+        # and is therefore fully enumerable by walking ParentProcessId from here on.
         Stop-DeclaredWorktreeWorker -ProcessId $workerPid -ExpectedStart $workerStart
         if ((Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart) -cne 'process-dead') { throw 'worktree-holder-alive' }
-        $mode = 'recovered'
+        $rootStopped = $true
     }
+
+    # A child the declared worker already spawned (its own CWD elsewhere, so it never blocks a removal
+    # attempt) can outlive the worker and still write a tracked change before it exits on its own,
+    # reproducing the exact same data loss this bead exists to close — just one process generation down
+    # (lived: found by external review round 12). This sweep runs unconditionally, even when $state was
+    # never 'ok' (the declared worker had already exited, or its PID no longer matches, before this call):
+    # Windows never revokes a live child's historical ParentProcessId when its parent exits, so an already-
+    # dead declared worker can still have live children needing to be stopped (lived: found by external
+    # review round 13).
+    $descendantsStopped = Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -MaxCount 256 -MaxPasses 6
+    if ($rootStopped -or $descendantsStopped) { $mode = 'recovered' }
+
+    Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
+    $adminDir = Get-WorktreeAdminDir -Context $Context -WorktreePath $worktreePath
+    $trackedPaths = Get-TrackedRelativePaths -WorktreePath $worktreePath
+    $autoCrlfSafe = Test-AutoCrlfSafe -WorktreePath $worktreePath
 
     if (Invoke-GuardedWorktreeRemoveAttempt -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath -AdminDir $adminDir -TrackedPaths $trackedPaths -AutoCrlfSafe $autoCrlfSafe) {
         [Console]::Out.WriteLine("GUARD_WORKTREE_REMOVED code=worktree-removed mode=$mode")
