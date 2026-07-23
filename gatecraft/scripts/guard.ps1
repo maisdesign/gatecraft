@@ -233,13 +233,73 @@ function ConvertTo-PositivePid {
     return $pidValue
 }
 
+function Get-ProcessCanonicalStart {
+    param([Parameter(Mandatory)][Diagnostics.Process] $Process)
+    return $Process.StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+}
+
+$script:GatecraftNativeProcessReady = $false
+function Initialize-GatecraftNativeProcess {
+    # A single native handle, opened with exactly the rights this operation needs (PROCESS_TERMINATE |
+    # PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE — the same union .NET's own Kill()/HasExited use
+    # internally), reused for the start-time check and the terminate call. This exists instead of the
+    # public Process.Handle/SafeHandle property specifically because that property requests
+    # PROCESS_ALL_ACCESS: a restricted/sandboxed declared worker's process ACL can legitimately deny that
+    # broad mask while still granting the narrow rights this command actually needs, which would make
+    # worktree-remove fail closed against a worker it should have been able to stop cleanly (lived: found
+    # by external review round 9).
+    if ($script:GatecraftNativeProcessReady) { return }
+    Add-Type -Namespace Gatecraft -Name NativeProcess -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool CloseHandle(IntPtr hObject);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetProcessTimes(IntPtr hProcess, out long lpCreationTime, out long lpExitTime, out long lpKernelTime, out long lpUserTime);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+'@
+    $script:GatecraftNativeProcessReady = $true
+}
+
+function Stop-DeclaredWorktreeWorker {
+    # Opens one native handle with the minimal rights above, validates the exact declared PID+start-time
+    # on that same handle, and terminates through it only on a match — closing the PID-reuse TOCTOU a
+    # per-property .NET handle (or Process.Handle's PROCESS_ALL_ACCESS) would each reopen or over-request.
+    # Best-effort: any failure here (process gone, access denied, mismatch) simply returns without acting;
+    # the caller's own Get-ProcessBindingState re-check afterward is what actually decides pass/fail, so
+    # this never needs to distinguish "already dead" from "couldn't confirm" to stay safe. Never touches
+    # any process but the exact declared PID+start-time.
+    param([Parameter(Mandatory)][int] $ProcessId, [Parameter(Mandatory)][string] $ExpectedStart)
+    Initialize-GatecraftNativeProcess
+    $access = 0x00101001  # PROCESS_TERMINATE (0x0001) | PROCESS_QUERY_LIMITED_INFORMATION (0x1000) | SYNCHRONIZE (0x00100000)
+    $handle = [Gatecraft.NativeProcess]::OpenProcess($access, $false, [uint32]$ProcessId)
+    if ($handle -eq [IntPtr]::Zero) { return }
+    try {
+        [uint32]$exitCode = 0
+        if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { return }
+        if ($exitCode -ne 259) { return }  # STILL_ACTIVE
+        [long]$creation = 0; [long]$exitTime = 0; [long]$kernelTime = 0; [long]$userTime = 0
+        if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { return }
+        $actualStart = [DateTime]::FromFileTimeUtc($creation).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+        if ($actualStart -cne $ExpectedStart) { return }
+        [void][Gatecraft.NativeProcess]::TerminateProcess($handle, 1)
+        [void][Gatecraft.NativeProcess]::WaitForSingleObject($handle, 5000)
+    }
+    finally { [void][Gatecraft.NativeProcess]::CloseHandle($handle) }
+}
+
 function Get-ProcessBindingState {
     param([int] $ProcessId, [string] $ExpectedStart)
     $process = $null
     try {
         $process = [Diagnostics.Process]::GetProcessById($ProcessId)
         if ($process.HasExited) { return 'process-dead' }
-        $actual = $process.StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+        $actual = Get-ProcessCanonicalStart -Process $process
         if ($actual -cne $ExpectedStart) { return 'process-start-mismatch' }
         return 'ok'
     }
@@ -1168,18 +1228,20 @@ function Invoke-WorktreeRemove {
     # Only a binding state confirmed not 'ok' (already dead, or the PID was reused by something
     # unrelated) — or a live holder this call itself just stopped and re-confirmed dead — may be
     # followed by declaring the worktree removed. Never discover "who else" might be locking it and
-    # never touch any process but the exact declared one.
+    # never touch any process but the exact declared one. `process-unverifiable` proves nothing — the
+    # declared worker could still be alive and holding this worktree — so it must fail closed rather
+    # than being treated like a confirmed-dead/mismatched PID (lived: found by external review round 7).
     $mode = "clean"
     $state = Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart
+    if ($state -ceq 'process-unverifiable') { throw 'worktree-holder-unverifiable' }
     if ($state -ceq 'ok') {
-        $process = $null
-        try {
-            $process = [Diagnostics.Process]::GetProcessById($workerPid)
-            $process.Kill($true)
-            [void]$process.WaitForExit(5000)
-        }
-        catch [ArgumentException] { }
-        finally { if ($null -ne $process) { $process.Dispose() } }
+        # Stop the exact declared worker through one native handle opened with only the rights this needs
+        # (see Stop-DeclaredWorktreeWorker) -- not .NET's Process.Handle/SafeHandle, whose implicit
+        # PROCESS_ALL_ACCESS request a restricted/sandboxed worker's process ACL can legitimately deny
+        # even though the narrow rights actually needed here are granted (lived: found by external review
+        # round 9, after round 8 closed a PID-reuse TOCTOU by forcing SafeHandle but introduced this
+        # access-rights regression). The re-check below is what actually decides pass/fail either way.
+        Stop-DeclaredWorktreeWorker -ProcessId $workerPid -ExpectedStart $workerStart
         if ((Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart) -cne 'process-dead') { throw 'worktree-holder-alive' }
         $mode = 'recovered'
     }
