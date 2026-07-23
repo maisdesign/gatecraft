@@ -546,16 +546,24 @@ function Stop-DescendantProcesses {
             $toStop = [Collections.Generic.List[object]]::new()
             foreach ($knownPid in @($seenStarts.Keys)) {
                 $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
-                # Pin the ENTIRE batch first, in its own pass with no check that can throw, before any
-                # duplicate/bound logic runs (lived: found by external review round 19 -- round 18's fix
-                # pinned one child at a time interleaved with the throwing bound-check, so a batch of
-                # several new children could still throw partway through, leaving any child positioned
-                # AFTER the one that tripped the throw neither pinned nor closed; List.Add itself cannot
-                # meaningfully throw here, so this first pass is unconditional). Every handle
-                # Get-ChildProcessRecords ever hands back is now owned by $pinnedHandles before the second
-                # pass below can ever throw, so the enclosing function-level `finally` closes it exactly
-                # once no matter what happens next.
-                foreach ($child in $children) { $pinnedHandles.Add($child.Handle) }
+                # Pin the ENTIRE batch first, in its own pass, before any duplicate/bound logic runs (lived:
+                # found by external review round 19 -- round 18's fix pinned one child at a time interleaved
+                # with the throwing bound-check, so a batch of several new children could still throw
+                # partway through, leaving any child positioned AFTER the one that tripped the throw
+                # neither pinned nor closed). List.Add itself can still fail (e.g. OutOfMemoryException
+                # growing the backing array) even though this pass has no application-level check that
+                # throws -- external review round 20 correctly rejected treating that as negligible given
+                # this same function already treats .ToArray()'s allocation as worth guarding elsewhere. If
+                # adding any one handle fails, every handle from that one (inclusive) onward in $children --
+                # none of which reached $pinnedHandles yet -- is closed here before rethrowing; everything
+                # before it was already added and is covered by the enclosing function-level `finally`.
+                for ($childIndex = 0; $childIndex -lt $children.Count; $childIndex++) {
+                    try { $pinnedHandles.Add($children[$childIndex].Handle) }
+                    catch {
+                        for ($cleanupIndex = $childIndex; $cleanupIndex -lt $children.Count; $cleanupIndex++) { [void][Gatecraft.NativeProcess]::CloseHandle($children[$cleanupIndex].Handle) }
+                        throw
+                    }
+                }
                 foreach ($child in $children) {
                     if ($seenStarts.ContainsKey($child.ProcessId)) { continue }
                     if ($seenStarts.Count -gt $MaxCount) { throw 'worktree-holder-descendants-unbounded' }

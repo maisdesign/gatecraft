@@ -172,18 +172,22 @@ Start-Sleep -Seconds 300
     return $root
 }
 
-function Start-TwoChildProcessTreeWorker {
-    # Spawns a root worker with TWO direct children discovered in the SAME Get-ChildProcessRecords call,
-    # so a fixture can deterministically exercise the "whole batch pinned before any throwing check runs"
-    # ordering (external review round 19's finding on Stop-DescendantProcesses' discovery loop) with a
-    # small --test-max-descendants override instead of needing hundreds of real processes to cross the
-    # production 256 ceiling.
+function Start-ThreeChildProcessTreeWorker {
+    # Spawns a root worker with THREE direct children discovered in the SAME Get-ChildProcessRecords call.
+    # Three, not two, is the minimum that actually reproduces round 18's original leak shape with
+    # --test-max-descendants 1 (external review round 20 pointed this out: with only two children, the
+    # second one is the one that trips the bound and throws, so nothing is ever left un-pinned after it --
+    # a third child is required so one is accepted, the second trips the throw, and the third is the one
+    # that would have leaked under round 18's one-at-a-time pinning). Lets a fixture deterministically
+    # exercise the "whole batch pinned before any throwing check runs" ordering (round 19's finding on
+    # Stop-DescendantProcesses' discovery loop) with a small override instead of needing hundreds of real
+    # processes to cross the production 256 ceiling.
     param([Parameter(Mandatory)][string] $ChildPidFile)
-    $rootScriptPath = Join-Path $testRoot 'two-child-process-tree-worker-root.ps1'
+    $rootScriptPath = Join-Path $testRoot 'three-child-process-tree-worker-root.ps1'
     if (-not [IO.File]::Exists($rootScriptPath)) {
         $rootScript = @'
 $ids = [Collections.Generic.List[string]]::new()
-for ($i = 0; $i -lt 2; $i++) {
+for ($i = 0; $i -lt 3; $i++) {
     $childInfo = [Diagnostics.ProcessStartInfo]::new()
     $childInfo.FileName = $env:GATECRAFT_TEST_PWSH_PATH
     $childInfo.UseShellExecute = $false
@@ -754,23 +758,27 @@ try {
         # returns MORE new descendants than --test-max-descendants allows -- external review round 19's
         # finding that Stop-DescendantProcesses' discovery loop pinned handles one child at a time,
         # interleaved with the very check that can throw, so any child positioned after the one that
-        # tripped the throw was neither pinned nor closed. --test-max-descendants lets this be exercised
-        # deterministically with 2 real children instead of the 257 real processes the production ceiling
-        # would need. This test cannot directly observe handle closure (guard.ps1 is a one-shot process
-        # that exits immediately after printing GUARD_FAILED, so the OS reclaims every handle at exit
-        # either way) -- what it CAN and does verify is that hitting the bound mid-batch fails closed with
-        # the correct code, leaves the worktree completely untouched, and does not crash or hang.
+        # tripped the throw was neither pinned nor closed. Three children, not two, is the minimum that
+        # actually reproduces that shape with --test-max-descendants 1 (external review round 20: with only
+        # two, the second child is the one that trips the bound and throws, so nothing is ever left
+        # unprocessed after it -- a third is needed so one is accepted, the second trips the throw, and the
+        # third is the one that would have leaked under round 18's one-at-a-time pinning). This test cannot
+        # directly observe handle closure (guard.ps1 is a one-shot process that exits immediately after
+        # printing GUARD_FAILED, so the OS reclaims every handle at exit either way, confirmed non-
+        # exploitable by external review round 20) -- what it CAN and does verify is that hitting the bound
+        # mid-batch fails closed with the correct code, leaves the worktree completely untouched, and does
+        # not crash or hang.
         $wtUnboundedRepo = New-TestRepository 'worktree-remove-unbounded-repo'
         $wtUnboundedPath = Join-Path $testRoot 'worktree-remove-unbounded-wt'
         Invoke-Git $wtUnboundedRepo worktree add $wtUnboundedPath -b wt-unbounded-branch | Out-Null
         $unboundedChildPidFile = Join-Path $testRoot 'unbounded-child-pids.txt'
-        $unboundedRoot = Start-TwoChildProcessTreeWorker -ChildPidFile $unboundedChildPidFile
+        $unboundedRoot = Start-ThreeChildProcessTreeWorker -ChildPidFile $unboundedChildPidFile
         $unboundedRootStart = Get-CanonicalStart $unboundedRoot
         $unboundedWaitDeadline = [DateTime]::UtcNow.AddSeconds(10)
         while (-not [IO.File]::Exists($unboundedChildPidFile) -and [DateTime]::UtcNow -lt $unboundedWaitDeadline) { Start-Sleep -Milliseconds 50 }
-        Assert-True ([IO.File]::Exists($unboundedChildPidFile)) 'Two-child fixture must confirm both children actually started.'
+        Assert-True ([IO.File]::Exists($unboundedChildPidFile)) 'Three-child fixture must confirm all three children actually started.'
         $unboundedChildPids = @(([IO.File]::ReadAllText($unboundedChildPidFile).Trim() -split "`n") | ForEach-Object { [int]$_.Trim() })
-        Assert-Equal $unboundedChildPids.Count 2 'Two-child fixture must have spawned exactly two children.'
+        Assert-Equal $unboundedChildPids.Count 3 'Three-child fixture must have spawned exactly three children.'
         $unboundedResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtUnboundedRepo,'--worktree-path',$wtUnboundedPath,'--worker-pid',([string]$unboundedRoot.Id),'--worker-process-start',$unboundedRootStart,'--test-max-descendants','1') -TestControls $true -TimeoutMilliseconds 30000
         Assert-True ($unboundedResult.ExitCode -ne 0 -and $unboundedResult.Error -match 'code=worktree-holder-descendants-unbounded') "Crossing --test-max-descendants mid-batch must fail closed with the unbounded code. stdout=$($unboundedResult.Output) stderr=$($unboundedResult.Error)"
         Assert-True ([IO.Directory]::Exists($wtUnboundedPath)) 'A descendants-unbounded failure must not delete the worktree directory.'
