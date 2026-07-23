@@ -16,6 +16,10 @@ Owner tokens use 32-128 ASCII letters, digits, underscore, or hyphen.
 Test-only acquire barrier:
   --test-acquire-barrier <absolute-existing-directory> --test-participant <stable-id> --test-timeout-ms <100-30000>
   All three options require GATECRAFT_GUARD_TEST_CONTROLS=1.
+
+Test-only diagnostic (requires GATECRAFT_GUARD_TEST_CONTROLS=1, never used in production removal logic):
+  guard.ps1 probe-child-window --repository-root <absolute-path> --parent-pid <positive-decimal> --minimum-start <canonical-UTC> --maximum-start <canonical-UTC>
+  Prints the exact PIDs Get-ChildProcessRecords accepts for that parent within [--minimum-start, --maximum-start) -- a direct, deterministic way to exercise the ancestry-window bound logic without depending on real OS PID-reuse timing.
 '@)
 }
 
@@ -42,13 +46,14 @@ function Read-GuardArguments {
     if ($Tokens.Count -eq 1 -and [string]$Tokens[0] -ceq '--help') { Write-GuardUsage; exit 0 }
     if ($Tokens.Count -lt 1) { throw 'argument-command-required' }
     $command = [string]$Tokens[0]
-    if ($command -cnotin @('acquire', 'release', 'baseline', 'sweep', 'worktree-remove')) { throw 'argument-command-invalid' }
+    if ($command -cnotin @('acquire', 'release', 'baseline', 'sweep', 'worktree-remove', 'probe-child-window')) { throw 'argument-command-invalid' }
     $allowedByCommand = @{
         acquire = @('--repository-root', '--owner-token', '--pid', '--process-start', '--test-acquire-barrier', '--test-participant', '--test-timeout-ms')
         release = @('--repository-root', '--owner-token', '--pid', '--process-start')
         baseline = @('--repository-root', '--state-root', '--baseline-id', '--owned-paths-json', '--process-manifest-json')
         sweep = @('--repository-root', '--state-root', '--baseline-id')
         'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start')
+        'probe-child-window' = @('--repository-root', '--parent-pid', '--minimum-start', '--maximum-start')
     }
     $requiredByCommand = @{
         acquire = @('--repository-root', '--owner-token', '--pid', '--process-start')
@@ -56,6 +61,7 @@ function Read-GuardArguments {
         baseline = @('--repository-root', '--state-root', '--baseline-id', '--owned-paths-json', '--process-manifest-json')
         sweep = @('--repository-root', '--state-root', '--baseline-id')
         'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start')
+        'probe-child-window' = @('--repository-root', '--parent-pid', '--minimum-start', '--maximum-start')
     }
     $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($name in $allowedByCommand[$command]) { [void]$allowed.Add($name) }
@@ -266,29 +272,59 @@ public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMillisecond
     $script:GatecraftNativeProcessReady = $true
 }
 
-function Stop-DeclaredWorktreeWorker {
-    # Opens one native handle with the minimal rights above, validates the exact declared PID+start-time
-    # on that same handle, and terminates through it only on a match — closing the PID-reuse TOCTOU a
-    # per-property .NET handle (or Process.Handle's PROCESS_ALL_ACCESS) would each reopen or over-request.
-    # Best-effort: any failure here (process gone, access denied, mismatch) simply returns without acting;
-    # the caller's own Get-ProcessBindingState re-check afterward is what actually decides pass/fail, so
-    # this never needs to distinguish "already dead" from "couldn't confirm" to stay safe. Never touches
-    # any process but the exact declared PID+start-time.
-    param([Parameter(Mandatory)][int] $ProcessId, [Parameter(Mandatory)][string] $ExpectedStart)
+function Resolve-ProcessLifecycle {
+    # Opens exactly ONE native handle for $ProcessId and performs the entire validate -> (terminate if
+    # still alive) -> confirm-dead sequence through that same handle, never reopening or re-resolving by
+    # PID at any step. This closes external review round 16's finding: the prior design (separate
+    # Get-ProcessBindingState / Stop-DeclaredWorktreeWorker / re-check calls) each opened and disposed
+    # their own handle, leaving a window between those internal steps where the declared PID could in
+    # principle be reused. A single continuously-held handle removes that window for the validate+kill
+    # step itself.
+    #
+    # Handle-pinning alone does not close the deeper problem round 16 actually pointed at, though: later
+    # code (Stop-DescendantProcesses) uses a PID as an "ancestry key" to re-query that process's own
+    # children across multiple passes, and a bare PID number is not a stable identity once the process
+    # behind it has exited — Windows can reuse the number for a wholly unrelated process, whose own real
+    # children would then be misattributed as descendants of the original. Closing that requires an
+    # authoritative UPPER bound on "no legitimate child of this PID could have been created after this
+    # instant" — which this function supplies as `ExitUtc`, read via GetProcessTimes' own `lpExitTime`
+    # once the process is confirmed no longer running. This is the OS kernel's own recorded exit
+    # timestamp, not a wall-clock observation on our side subject to scheduling jitter — the same class of
+    # authoritative timestamp already used for `Get-ProcessCanonicalStart`/creation-time comparisons
+    # elsewhere in this file. Callers use `ExitUtc` as the exclusive upper bound (see
+    # Get-ChildProcessRecords' `-MaximumStartExclusive`) when trusting any later "child of this PID" query.
+    #
+    # Fails closed (throws $FailClosedCode) on anything that cannot be resolved through this one handle:
+    # the PID could not be opened, its creation time no longer matches $ExpectedStart (reused/wrong
+    # process), termination could not be confirmed within the wait, or the post-mortem exit time could not
+    # be read. Never touches any process but the exact declared PID+start-time.
+    param(
+        [Parameter(Mandatory)][int] $ProcessId,
+        [Parameter(Mandatory)][string] $ExpectedStart,
+        [Parameter(Mandatory)][string] $FailClosedCode
+    )
     Initialize-GatecraftNativeProcess
     $access = 0x00101001  # PROCESS_TERMINATE (0x0001) | PROCESS_QUERY_LIMITED_INFORMATION (0x1000) | SYNCHRONIZE (0x00100000)
     $handle = [Gatecraft.NativeProcess]::OpenProcess($access, $false, [uint32]$ProcessId)
-    if ($handle -eq [IntPtr]::Zero) { return }
+    if ($handle -eq [IntPtr]::Zero) { throw $FailClosedCode }
     try {
-        [uint32]$exitCode = 0
-        if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { return }
-        if ($exitCode -ne 259) { return }  # STILL_ACTIVE
         [long]$creation = 0; [long]$exitTime = 0; [long]$kernelTime = 0; [long]$userTime = 0
-        if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { return }
+        if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { throw $FailClosedCode }
         $actualStart = [DateTime]::FromFileTimeUtc($creation).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
-        if ($actualStart -cne $ExpectedStart) { return }
-        [void][Gatecraft.NativeProcess]::TerminateProcess($handle, 1)
-        [void][Gatecraft.NativeProcess]::WaitForSingleObject($handle, 5000)
+        if ($actualStart -cne $ExpectedStart) { throw $FailClosedCode }
+        [uint32]$exitCode = 0
+        if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw $FailClosedCode }
+        if ($exitCode -eq 259) {  # STILL_ACTIVE
+            [void][Gatecraft.NativeProcess]::TerminateProcess($handle, 1)
+            if ([Gatecraft.NativeProcess]::WaitForSingleObject($handle, 5000) -ne 0) { throw $FailClosedCode }  # not WAIT_OBJECT_0
+            if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw $FailClosedCode }
+            if ($exitCode -eq 259) { throw $FailClosedCode }
+        }
+        # Re-read process times now that exit is confirmed: lpExitTime is meaningless/zero while a process
+        # is still running, but becomes the OS's own authoritative exit instant once it has stopped.
+        if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { throw $FailClosedCode }
+        if ($exitTime -le 0) { throw $FailClosedCode }
+        return [pscustomobject]@{ ProcessId = $ProcessId; Start = $actualStart; ExitUtc = [DateTime]::FromFileTimeUtc($exitTime) }
     }
     finally { [void][Gatecraft.NativeProcess]::CloseHandle($handle) }
 }
@@ -346,7 +382,18 @@ function Get-ChildProcessRecords {
     # (lived: found by external review round 14). A real child can never have been created before its
     # true parent, so any candidate whose own creation time predates $MinimumStart (the queried parent's
     # own validated creation time) is rejected as ancestry-unrelated rather than trusted on PID match alone.
-    param([Parameter(Mandatory)][int] $ParentProcessId, [Parameter(Mandatory)][DateTime] $MinimumStart)
+    #
+    # $MaximumStartExclusive is the mirror-image bound, closing external review round 16's ancestry-
+    # confusion finding: a lower bound alone cannot tell "created after the parent started" apart from
+    # "created after the parent started, but really by a different, unrelated process U that later reused
+    # the parent's own PID number" -- both satisfy $MinimumStart. Once $ParentProcessId is confirmed to
+    # have exited (Resolve-ProcessLifecycle's `ExitUtc`, the OS's own recorded exit instant), no further
+    # legitimate child can ever appear from it -- a real child's creation must strictly precede its true
+    # parent's own exit. Any candidate whose creation time falls at or after that instant cannot be this
+    # PID's child; it can only be explained by the number having already been reused by something else, so
+    # it is rejected the same way an under-$MinimumStart candidate is, rather than trusted on the numeric
+    # ParentProcessId match alone.
+    param([Parameter(Mandatory)][int] $ParentProcessId, [Parameter(Mandatory)][DateTime] $MinimumStart, [Parameter(Mandatory)][DateTime] $MaximumStartExclusive)
     try {
         $rows = @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId=$ParentProcessId" -ErrorAction Stop)
     }
@@ -362,7 +409,7 @@ function Get-ChildProcessRecords {
             $actualStartUtc = $process.StartTime.ToUniversalTime()
             $deltaTicks = [Math]::Abs(($row.CreationDate.ToUniversalTime() - $actualStartUtc).Ticks)
             if ($deltaTicks -ge 10) { continue }
-            if ($actualStartUtc -lt $MinimumStart) { continue }
+            if ($actualStartUtc -lt $MinimumStart -or $actualStartUtc -ge $MaximumStartExclusive) { continue }
             $records.Add([pscustomobject]@{ ProcessId = $childPid; Start = (Get-ProcessCanonicalStart -Process $process); StartUtc = $actualStartUtc })
         }
         catch [ArgumentException] { continue }
@@ -398,34 +445,39 @@ function Stop-DescendantProcesses {
     # including ones already dead-and-delinked from live enumeration) -- a change to how workers are
     # launched, not to this function.
     #
-    # KNOWN GAP #2 -- CONFIRMED, BLOCKING, NOT YET FIXED (found by external review round 16, after round
-    # 15's fix scoped this sweep to only the just-validated-live-and-killed-by-this-call branch): scoping
-    # to that branch narrows the window but does not close it, because every validation/kill step here
-    # (Get-ProcessBindingState, Stop-DeclaredWorktreeWorker) opens and then DISPOSES its own handle rather
-    # than holding one continuously. Windows offers no minimum grace period before reusing a PID once its
-    # last handle closes -- reuse can happen in the instant between this function's own CIM queries, not
-    # just across wall-clock time, and the same defect repeats for every discovered descendant's own PID
-    # (its handle likewise closes after Stop-DeclaredWorktreeWorker kills it, yet that PID remains an
-    # ancestry key re-queried on later passes and the final confirmation). Closing this for real needs a
-    # continuously-held OS handle on every PID used as an ancestry key, from the moment it is validated
-    # until the sweep's very last confirmation query -- not yet implemented. Round 16 explicitly declared
-    # the currently-committed state (commit 899200c) NOT acceptable to merge because of this; do not treat
-    # this function's behavior as fully closing the ancestry-confusion class of finding.
-    param([Parameter(Mandatory)][int] $RootProcessId, [Parameter(Mandatory)][string] $RootStart, [Parameter(Mandatory)][int] $MaxCount, [Parameter(Mandatory)][int] $MaxPasses)
+    # GAP #2 CLOSED (external review round 16's finding, fixed round 17): every validate/kill step for
+    # every PID used as an ancestry key -- the root (see caller) and every discovered descendant below --
+    # now goes through Resolve-ProcessLifecycle's single continuously-held native handle instead of the
+    # old open-then-dispose-then-reopen sequence. That handle, before it is closed, yields `ExitUtc`: the
+    # OS's own recorded exit instant for that exact PID. This function threads `ExitUtc` through as each
+    # known PID's upper bound (`$seenExits`), passed to Get-ChildProcessRecords as
+    # `-MaximumStartExclusive` alongside the existing lower bound (`$seenStarts`) -- so a later "child of
+    # this PID" query can only match candidates created strictly between that PID's own validated start
+    # and its own confirmed exit, never after. A PID reused by an unrelated process after that exit can
+    # only produce candidates created at-or-after the exit bound, which the upper-bound check now rejects
+    # the same way an under-$MinimumStart candidate always was. Round 16 explicitly declared the prior
+    # state (commit 899200c) not acceptable to merge on this basis; this closes it.
+    param([Parameter(Mandatory)][int] $RootProcessId, [Parameter(Mandatory)][string] $RootStart, [Parameter(Mandatory)][DateTime] $RootExitUtc, [Parameter(Mandatory)][int] $MaxCount, [Parameter(Mandatory)][int] $MaxPasses)
     # Maps each known PID in this sweep to its own validated creation time (the root's caller-declared
     # start, or a discovered descendant's own WMI/GetProcessById-cross-checked start) -- this is the lower
     # bound passed to Get-ChildProcessRecords when querying that PID's own children, so a numeric
     # ParentProcessId match alone is never enough to trust a candidate as a real descendant (see
     # Get-ChildProcessRecords' own comment on the ancestry-confusion gap this closes).
     $seenStarts = [Collections.Generic.Dictionary[int, DateTime]]::new()
+    # Mirrors $seenStarts: each known PID's own confirmed exit instant (Resolve-ProcessLifecycle's
+    # `ExitUtc`), used as that PID's upper bound. A PID only ever enters $seenStarts once this function (or
+    # the caller, for the root) has already resolved and killed it, so both dictionaries are always
+    # populated together -- never one without the other.
+    $seenExits = [Collections.Generic.Dictionary[int, DateTime]]::new()
     $rootStartUtc = [DateTime]::Parse($RootStart, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
     $seenStarts[$RootProcessId] = $rootStartUtc
+    $seenExits[$RootProcessId] = $RootExitUtc
     $stoppedAny = $false
     for ($pass = 0; $pass -lt $MaxPasses; $pass++) {
         $discoveredNew = $false
         $toStop = [Collections.Generic.List[object]]::new()
         foreach ($knownPid in @($seenStarts.Keys)) {
-            $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
+            $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid] -MaximumStartExclusive $seenExits[$knownPid]
             foreach ($child in $children) {
                 if ($seenStarts.ContainsKey($child.ProcessId)) { continue }
                 if ($seenStarts.Count -gt $MaxCount) { throw 'worktree-holder-descendants-unbounded' }
@@ -435,7 +487,8 @@ function Stop-DescendantProcesses {
             }
         }
         foreach ($descendant in $toStop) {
-            Stop-DeclaredWorktreeWorker -ProcessId $descendant.ProcessId -ExpectedStart $descendant.Start
+            $lifecycle = Resolve-ProcessLifecycle -ProcessId $descendant.ProcessId -ExpectedStart $descendant.Start -FailClosedCode 'worktree-holder-descendant-alive'
+            $seenExits[$descendant.ProcessId] = $lifecycle.ExitUtc
             $stoppedAny = $true
         }
         if (-not $discoveredNew) { break }
@@ -450,7 +503,7 @@ function Stop-DescendantProcesses {
         # effectively 1 regardless of the real record count. See the two other array-unrolling pitfalls
         # already documented on Get-ChildProcessRecords/its callers; this is the same class of mistake in
         # the opposite direction (over-wrapping instead of under-wrapping).
-        $remaining = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
+        $remaining = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid] -MaximumStartExclusive $seenExits[$knownPid]
         if ($remaining.Count -gt 0) { throw 'worktree-holder-descendant-alive' }
     }
     return $stoppedAny
@@ -1385,19 +1438,21 @@ function Invoke-WorktreeRemove {
     $state = Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart
     if ($state -ceq 'process-unverifiable') { throw 'worktree-holder-unverifiable' }
     if ($state -ceq 'ok') {
-        # Stop the exact declared worker through one native handle opened with only the rights this needs
-        # (see Stop-DeclaredWorktreeWorker) -- not .NET's Process.Handle/SafeHandle, whose implicit
-        # PROCESS_ALL_ACCESS request a restricted/sandboxed worker's process ACL can legitimately deny
-        # even though the narrow rights actually needed here are granted (lived: found by external review
-        # round 9, after round 8 closed a PID-reuse TOCTOU by forcing SafeHandle but introduced this
-        # access-rights regression). The re-check below is what actually decides pass/fail either way.
+        # Stop the exact declared worker through one native handle opened with only the rights this needs,
+        # held continuously across validate+kill+confirm (see Resolve-ProcessLifecycle) -- not .NET's
+        # Process.Handle/SafeHandle, whose implicit PROCESS_ALL_ACCESS request a restricted/sandboxed
+        # worker's process ACL can legitimately deny even though the narrow rights actually needed here
+        # are granted (lived: found by external review round 9); and not the old separate
+        # validate/kill/re-check calls each opening and disposing their own handle (lived: found by
+        # external review round 16 -- fixed round 17 by routing this entirely through
+        # Resolve-ProcessLifecycle, which throws fail-closed on any mismatch, unconfirmed termination, or
+        # unreadable exit time, so a non-throwing return here already means the worker is confirmed dead).
         # Stopped first, before touching any descendant: TerminateProcess never implicitly kills a
         # process's children on Windows (there is no Job Object here to make that atomic), so a live
         # child could otherwise go on spawning further children indefinitely. Killing the root here first
         # means it can never start another one — every descendant left after this point already existed
         # and is therefore fully enumerable by walking ParentProcessId from here on.
-        Stop-DeclaredWorktreeWorker -ProcessId $workerPid -ExpectedStart $workerStart
-        if ((Get-ProcessBindingState -ProcessId $workerPid -ExpectedStart $workerStart) -cne 'process-dead') { throw 'worktree-holder-alive' }
+        $rootLifecycle = Resolve-ProcessLifecycle -ProcessId $workerPid -ExpectedStart $workerStart -FailClosedCode 'worktree-holder-alive'
         $mode = 'recovered'
 
         # A child the declared worker already spawned (its own CWD elsewhere, so it never blocks a
@@ -1414,16 +1469,13 @@ function Invoke-WorktreeRemove {
         # a wholly unrelated live process U between the declared worker's actual exit and this invocation,
         # "children of $workerPid" now means U's own real, legitimate children — a creation-time lower
         # bound alone cannot tell U's child apart from the declared worker's, since both were created
-        # after the declared worker's own start. Scoping to only the just-validated branch narrows that
-        # window but, per round 16, does NOT close it: Get-ProcessBindingState and
-        # Stop-DeclaredWorktreeWorker each open and dispose their own handle rather than holding one
-        # continuously, and Windows offers no minimum grace period before reusing a PID once its last
-        # handle closes — reuse can happen between this call's own internal steps, not only across real
-        # wall-clock delay. See Stop-DescendantProcesses' own "KNOWN GAP #2" comment: this remains a
-        # confirmed, NOT-yet-fixed blocking gap (round 16 declared commit 899200c unmergeable on this
-        # basis) requiring either a continuously-held handle across the whole validate/kill/sweep sequence
-        # for every PID used as an ancestry key, or a Windows Job Object — not yet implemented.
-        [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -MaxCount 256 -MaxPasses 6)
+        # after the declared worker's own start. Round 16 found scoping to only the just-validated branch
+        # narrows that window but does not close it by itself; round 17 closes it by passing
+        # $rootLifecycle.ExitUtc — the OS's own recorded exit instant for this exact PID, read through the
+        # same handle that killed it — into Stop-DescendantProcesses as the root's upper bound, so any
+        # later "child of $workerPid" query rejects candidates created at-or-after that instant (see
+        # Get-ChildProcessRecords' `-MaximumStartExclusive` and Stop-DescendantProcesses' own comment).
+        [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -RootExitUtc $rootLifecycle.ExitUtc -MaxCount 256 -MaxPasses 6)
     }
 
     Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
@@ -1443,12 +1495,35 @@ function Invoke-WorktreeRemove {
     [Console]::Out.WriteLine('GUARD_WORKTREE_REMOVED code=worktree-removed mode=recovered')
 }
 
+function Invoke-ProbeChildWindow {
+    # Test-only diagnostic (gated by GATECRAFT_GUARD_TEST_CONTROLS=1 at the dispatcher, never reachable in
+    # production use): calls Get-ChildProcessRecords directly with caller-supplied bounds and prints the
+    # accepted PIDs. Exists because real OS-level PID reuse cannot be forced on demand in a test, but the
+    # bound-rejection logic itself (the actual mechanism external review round 16's fix depends on) can be
+    # exercised deterministically against real, live processes by supplying a --maximum-start narrower than
+    # a real child's own creation time and confirming it is excluded, and a real window that legitimately
+    # contains it and confirming it is included. Never invoked by Invoke-WorktreeRemove or any other
+    # production path.
+    param([object] $Context, [Collections.Generic.Dictionary[string,string]] $Options)
+    [void]$Context
+    $parentPid = ConvertTo-PositivePid -Value $Options['--parent-pid']
+    $minimumStart = ConvertTo-CanonicalProcessStart -Value $Options['--minimum-start']
+    $maximumStart = ConvertTo-CanonicalProcessStart -Value $Options['--maximum-start']
+    $minimumStartUtc = [DateTime]::Parse($minimumStart, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+    $maximumStartUtc = [DateTime]::Parse($maximumStart, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+    $records = Get-ChildProcessRecords -ParentProcessId $parentPid -MinimumStart $minimumStartUtc -MaximumStartExclusive $maximumStartUtc
+    $pids = [Collections.Generic.List[int]]::new()
+    foreach ($record in $records) { $pids.Add($record.ProcessId) }
+    [Console]::Out.WriteLine((ConvertTo-CanonicalJson -Value @($pids)))
+}
+
 if ($PSVersionTable.PSVersion.Major -lt 7) { Stop-Guard -ExitCode 64 -Code 'powershell-version' }
 
 try {
     $parsed = Read-GuardArguments -Tokens @($args)
     $testOptionsPresent = @(@('--test-acquire-barrier','--test-participant','--test-timeout-ms') | Where-Object { $parsed.Values.ContainsKey($_) })
     if ($testOptionsPresent.Count -gt 0 -and [Environment]::GetEnvironmentVariable('GATECRAFT_GUARD_TEST_CONTROLS', [EnvironmentVariableTarget]::Process) -cne '1') { throw 'test-controls-disabled' }
+    if ($parsed.Command -ceq 'probe-child-window' -and [Environment]::GetEnvironmentVariable('GATECRAFT_GUARD_TEST_CONTROLS', [EnvironmentVariableTarget]::Process) -cne '1') { throw 'test-controls-disabled' }
     $context = Get-RepositoryContext -DeclaredRoot $parsed.Values['--repository-root']
     switch ($parsed.Command) {
         'acquire' { Invoke-LockAcquire -Context $context -Options $parsed.Values }
@@ -1456,6 +1531,7 @@ try {
         'baseline' { Invoke-BaselineCreate -Context $context -Options $parsed.Values }
         'sweep' { Invoke-BaselineSweep -Context $context -Options $parsed.Values }
         'worktree-remove' { Invoke-WorktreeRemove -Context $context -Options $parsed.Values }
+        'probe-child-window' { Invoke-ProbeChildWindow -Context $context -Options $parsed.Values }
     }
     exit 0
 }
