@@ -373,12 +373,9 @@ function Get-ChildProcessRecords {
 }
 
 function Stop-DescendantProcesses {
-    # Sweeps and stops a declared root PID's entire descendant tree, then confirms none remain. Runs
-    # unconditionally against $RootProcessId regardless of the declared worker's own binding state --
-    # Windows never revokes a live child's historical ParentProcessId when its parent exits, so a worker
-    # already dead before this call (state != 'ok') can still have left live children behind, and skipping
-    # this sweep in that case would let them survive to the clean snapshot untouched (lived: found by
-    # external review round 13).
+    # Sweeps and stops a declared root PID's entire descendant tree, then confirms none remain. Called
+    # only from the branch where this exact invocation just validated the declared worker as live
+    # ('ok') and killed it itself (see the caller, Invoke-WorktreeRemove) -- NOT unconditionally.
     #
     # A per-pass restart from the root alone is not enough: once an intermediary node (say C, a child of
     # the root) is itself stopped, Win32_Process's ParentProcessId enumeration can no longer reach it by
@@ -388,18 +385,32 @@ function Stop-DescendantProcesses {
     # (not just the ones still alive), a live grandchild whose only path from the root ran through a node
     # THIS FUNCTION ITSELF stopped in an earlier pass is never lost.
     #
-    # KNOWN RESIDUAL GAP (documented, not fixed -- confirmed real by external review round 13 and by a
-    # direct repro): this only helps for an intermediary this sweep has already observed alive at least
-    # once. If C exits ON ITS OWN before this function's very first query ever runs (e.g. a worker that
-    # spawns a short-lived relay process which itself spawns a longer-lived one, then exits immediately),
-    # this sweep never learns C's PID existed at all, so C's own live children (like G) are permanently
-    # unreachable via ParentProcessId chaining -- there is no record anywhere of "G's parent used to be
-    # C" once Win32_Process stops listing C, because it only ever lists currently-alive processes. No
-    # pure application-level fix closes this: it needs a Windows Job Object assigned to the worker at
-    # spawn time (TerminateJobObject kills every process ever added to the job, including ones already
-    # dead-and-delinked from live enumeration) -- a change to how workers are launched, not to this
-    # function. Accepted as a known, narrower guarantee rather than blocking on an architecture change
-    # that reaches outside guard.ps1.
+    # KNOWN RESIDUAL GAP #1 (documented, not fixed -- confirmed real by external review round 13 and by a
+    # direct repro): the above only helps for an intermediary this sweep has already observed alive at
+    # least once. If C exits ON ITS OWN before this function's very first query ever runs (e.g. a worker
+    # that spawns a short-lived relay process which itself spawns a longer-lived one, then exits
+    # immediately), this sweep never learns C's PID existed at all. G's own live process still correctly
+    # reports ParentProcessId=C's old PID -- that field itself never becomes wrong or disappears -- but
+    # the *discoverable path* from the root to that fact is gone: nothing enumerable from the root's own
+    # (or any other known) PID ever points at C once Win32_Process stops listing C, because it only lists
+    # currently-alive processes. No pure application-level fix closes this: it needs a Windows Job Object
+    # assigned to the worker at spawn time (TerminateJobObject kills every process ever added to the job,
+    # including ones already dead-and-delinked from live enumeration) -- a change to how workers are
+    # launched, not to this function.
+    #
+    # KNOWN GAP #2 -- CONFIRMED, BLOCKING, NOT YET FIXED (found by external review round 16, after round
+    # 15's fix scoped this sweep to only the just-validated-live-and-killed-by-this-call branch): scoping
+    # to that branch narrows the window but does not close it, because every validation/kill step here
+    # (Get-ProcessBindingState, Stop-DeclaredWorktreeWorker) opens and then DISPOSES its own handle rather
+    # than holding one continuously. Windows offers no minimum grace period before reusing a PID once its
+    # last handle closes -- reuse can happen in the instant between this function's own CIM queries, not
+    # just across wall-clock time, and the same defect repeats for every discovered descendant's own PID
+    # (its handle likewise closes after Stop-DeclaredWorktreeWorker kills it, yet that PID remains an
+    # ancestry key re-queried on later passes and the final confirmation). Closing this for real needs a
+    # continuously-held OS handle on every PID used as an ancestry key, from the moment it is validated
+    # until the sweep's very last confirmation query -- not yet implemented. Round 16 explicitly declared
+    # the currently-committed state (commit 899200c) NOT acceptable to merge because of this; do not treat
+    # this function's behavior as fully closing the ancestry-confusion class of finding.
     param([Parameter(Mandatory)][int] $RootProcessId, [Parameter(Mandatory)][string] $RootStart, [Parameter(Mandatory)][int] $MaxCount, [Parameter(Mandatory)][int] $MaxPasses)
     # Maps each known PID in this sweep to its own validated creation time (the root's caller-declared
     # start, or a discovered descendant's own WMI/GetProcessById-cross-checked start) -- this is the lower
@@ -1395,23 +1406,23 @@ function Invoke-WorktreeRemove {
         # generation down (lived: found by external review round 12).
         #
         # Deliberately scoped to only run here, immediately after THIS call validated $workerPid as the
-        # exact declared worker (state was 'ok' a moment ago) and then killed it itself: within that
-        # narrow, uninterrupted window there has been no opportunity for Windows to reuse $workerPid for
-        # an unrelated process, so "children of $workerPid" unambiguously means the declared worker's own
-        # children. Round 13 tried running this same sweep unconditionally (including when $state was
-        # 'process-dead' or 'process-start-mismatch' — the declared worker already gone or replaced before
-        # this call even started), reasoning that ParentProcessId is fixed at creation and outlives its
-        # parent. That is true, but round 15 review found a sharper problem it doesn't solve: if
-        # $workerPid was reused by a wholly unrelated live process U between the declared worker's actual
-        # exit and this invocation, "children of $workerPid" now means U's own real, legitimate children —
-        # a creation-time lower bound alone cannot tell U's child apart from the declared worker's, since
-        # both were created after the declared worker's own start. Closing that fully would need an upper
-        # bound on exactly when the declared worker's own reign over this PID ended, which this command has
-        # no way to know precisely from the outside — or a Windows Job Object assigned at spawn time,
-        # tracking real membership instead of inferring it from a recycled PID number. Accepted as a known,
-        # narrower guarantee: this sweep only ever runs against a PID this exact call just confirmed and
-        # killed as the genuine declared worker, never against a PID whose identity this call could not
-        # itself just verify.
+        # exact declared worker (state was 'ok' a moment ago) and then killed it itself. Round 13 tried
+        # running this same sweep unconditionally (including when $state was 'process-dead' or
+        # 'process-start-mismatch' — the declared worker already gone or replaced before this call even
+        # started), reasoning that ParentProcessId is fixed at creation and outlives its parent. That is
+        # true, but round 15 review found a sharper problem it doesn't solve: if $workerPid was reused by
+        # a wholly unrelated live process U between the declared worker's actual exit and this invocation,
+        # "children of $workerPid" now means U's own real, legitimate children — a creation-time lower
+        # bound alone cannot tell U's child apart from the declared worker's, since both were created
+        # after the declared worker's own start. Scoping to only the just-validated branch narrows that
+        # window but, per round 16, does NOT close it: Get-ProcessBindingState and
+        # Stop-DeclaredWorktreeWorker each open and dispose their own handle rather than holding one
+        # continuously, and Windows offers no minimum grace period before reusing a PID once its last
+        # handle closes — reuse can happen between this call's own internal steps, not only across real
+        # wall-clock delay. See Stop-DescendantProcesses' own "KNOWN GAP #2" comment: this remains a
+        # confirmed, NOT-yet-fixed blocking gap (round 16 declared commit 899200c unmergeable on this
+        # basis) requiring either a continuously-held handle across the whole validate/kill/sweep sequence
+        # for every PID used as an ancestry key, or a Windows Job Object — not yet implemented.
         [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -MaxCount 256 -MaxPasses 6)
     }
 
