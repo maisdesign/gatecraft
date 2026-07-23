@@ -172,6 +172,49 @@ Start-Sleep -Seconds 300
     return $root
 }
 
+function Start-TwoChildProcessTreeWorker {
+    # Spawns a root worker with TWO direct children discovered in the SAME Get-ChildProcessRecords call,
+    # so a fixture can deterministically exercise the "whole batch pinned before any throwing check runs"
+    # ordering (external review round 19's finding on Stop-DescendantProcesses' discovery loop) with a
+    # small --test-max-descendants override instead of needing hundreds of real processes to cross the
+    # production 256 ceiling.
+    param([Parameter(Mandatory)][string] $ChildPidFile)
+    $rootScriptPath = Join-Path $testRoot 'two-child-process-tree-worker-root.ps1'
+    if (-not [IO.File]::Exists($rootScriptPath)) {
+        $rootScript = @'
+$ids = [Collections.Generic.List[string]]::new()
+for ($i = 0; $i -lt 2; $i++) {
+    $childInfo = [Diagnostics.ProcessStartInfo]::new()
+    $childInfo.FileName = $env:GATECRAFT_TEST_PWSH_PATH
+    $childInfo.UseShellExecute = $false
+    $childInfo.CreateNoWindow = $true
+    $childInfo.ArgumentList.Add('-NoLogo')
+    $childInfo.ArgumentList.Add('-NoProfile')
+    $childInfo.ArgumentList.Add('-Command')
+    $childInfo.ArgumentList.Add('Start-Sleep -Seconds 300')
+    $child = [Diagnostics.Process]::Start($childInfo)
+    $ids.Add([string]$child.Id)
+}
+[IO.File]::WriteAllText($env:GATECRAFT_TEST_CHILD_PID_FILE, ($ids -join "`n"))
+Start-Sleep -Seconds 300
+'@
+        [IO.File]::WriteAllText($rootScriptPath, $rootScript, $utf8)
+    }
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $pwshPath
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.Environment['GATECRAFT_TEST_PWSH_PATH'] = $pwshPath
+    $info.Environment['GATECRAFT_TEST_CHILD_PID_FILE'] = $ChildPidFile
+    $info.ArgumentList.Add('-NoLogo')
+    $info.ArgumentList.Add('-NoProfile')
+    $info.ArgumentList.Add('-File')
+    $info.ArgumentList.Add($rootScriptPath)
+    $root = [Diagnostics.Process]::Start($info)
+    $children.Add($root)
+    return $root
+}
+
 function New-GuardStartInfo {
     param([string] $Surface, [string[]] $Arguments, [bool] $TestControls)
     $info = [Diagnostics.ProcessStartInfo]::new()
@@ -706,6 +749,38 @@ try {
         $registeredAfterDescendant = (& git -C $wtDescendantRepo worktree list --porcelain) -join "`n"
         Assert-True (-not $registeredAfterDescendant.Contains($wtDescendantPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase)) 'Worktree-remove must unregister the worktree from git.'
         $descendantChild.Dispose()
+
+        # worktree-remove must fail closed, and leak no discovered handle, when a single discovery pass
+        # returns MORE new descendants than --test-max-descendants allows -- external review round 19's
+        # finding that Stop-DescendantProcesses' discovery loop pinned handles one child at a time,
+        # interleaved with the very check that can throw, so any child positioned after the one that
+        # tripped the throw was neither pinned nor closed. --test-max-descendants lets this be exercised
+        # deterministically with 2 real children instead of the 257 real processes the production ceiling
+        # would need. This test cannot directly observe handle closure (guard.ps1 is a one-shot process
+        # that exits immediately after printing GUARD_FAILED, so the OS reclaims every handle at exit
+        # either way) -- what it CAN and does verify is that hitting the bound mid-batch fails closed with
+        # the correct code, leaves the worktree completely untouched, and does not crash or hang.
+        $wtUnboundedRepo = New-TestRepository 'worktree-remove-unbounded-repo'
+        $wtUnboundedPath = Join-Path $testRoot 'worktree-remove-unbounded-wt'
+        Invoke-Git $wtUnboundedRepo worktree add $wtUnboundedPath -b wt-unbounded-branch | Out-Null
+        $unboundedChildPidFile = Join-Path $testRoot 'unbounded-child-pids.txt'
+        $unboundedRoot = Start-TwoChildProcessTreeWorker -ChildPidFile $unboundedChildPidFile
+        $unboundedRootStart = Get-CanonicalStart $unboundedRoot
+        $unboundedWaitDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not [IO.File]::Exists($unboundedChildPidFile) -and [DateTime]::UtcNow -lt $unboundedWaitDeadline) { Start-Sleep -Milliseconds 50 }
+        Assert-True ([IO.File]::Exists($unboundedChildPidFile)) 'Two-child fixture must confirm both children actually started.'
+        $unboundedChildPids = @(([IO.File]::ReadAllText($unboundedChildPidFile).Trim() -split "`n") | ForEach-Object { [int]$_.Trim() })
+        Assert-Equal $unboundedChildPids.Count 2 'Two-child fixture must have spawned exactly two children.'
+        $unboundedResult = Invoke-Guard -Arguments @('worktree-remove','--repository-root',$wtUnboundedRepo,'--worktree-path',$wtUnboundedPath,'--worker-pid',([string]$unboundedRoot.Id),'--worker-process-start',$unboundedRootStart,'--test-max-descendants','1') -TestControls $true -TimeoutMilliseconds 30000
+        Assert-True ($unboundedResult.ExitCode -ne 0 -and $unboundedResult.Error -match 'code=worktree-holder-descendants-unbounded') "Crossing --test-max-descendants mid-batch must fail closed with the unbounded code. stdout=$($unboundedResult.Output) stderr=$($unboundedResult.Error)"
+        Assert-True ([IO.Directory]::Exists($wtUnboundedPath)) 'A descendants-unbounded failure must not delete the worktree directory.'
+        $registeredAfterUnbounded = (& git -C $wtUnboundedRepo worktree list --porcelain) -join "`n"
+        Assert-True $registeredAfterUnbounded.Contains($wtUnboundedPath.Replace('\', '/'), [StringComparison]::OrdinalIgnoreCase) 'A descendants-unbounded failure must leave the worktree registered.'
+        foreach ($childPid in $unboundedChildPids) {
+            $childProcess = $null
+            try { $childProcess = [Diagnostics.Process]::GetProcessById($childPid) } catch [ArgumentException] { }
+            if ($null -ne $childProcess) { $childProcess.Kill($true); $childProcess.WaitForExit(); $childProcess.Dispose() }
+        }
 
         # probe-child-window: a direct, deterministic exercise of Get-ChildProcessRecords' real, live-
         # process discovery and $MinimumStart ancestry-lower-bound logic against a REAL parent/child pair.

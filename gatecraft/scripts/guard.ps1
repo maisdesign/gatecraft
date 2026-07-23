@@ -20,6 +20,10 @@ Test-only acquire barrier:
 Test-only diagnostic (requires GATECRAFT_GUARD_TEST_CONTROLS=1, never used in production removal logic):
   guard.ps1 probe-child-window --repository-root <absolute-path> --parent-pid <positive-decimal> --minimum-start <canonical-UTC>
   Prints the exact PIDs Get-ChildProcessRecords accepts for that parent at-or-after --minimum-start -- a direct, deterministic way to exercise the ancestry lower-bound logic without depending on real OS PID-reuse timing.
+
+Test-only descendant-count override (requires GATECRAFT_GUARD_TEST_CONTROLS=1):
+  guard.ps1 worktree-remove ... --test-max-descendants <positive-decimal>
+  Overrides the production 256-descendant ceiling so a fixture can deterministically cross it with a handful of real processes instead of spawning hundreds. Production callers never pass this.
 '@)
 }
 
@@ -52,7 +56,7 @@ function Read-GuardArguments {
         release = @('--repository-root', '--owner-token', '--pid', '--process-start')
         baseline = @('--repository-root', '--state-root', '--baseline-id', '--owned-paths-json', '--process-manifest-json')
         sweep = @('--repository-root', '--state-root', '--baseline-id')
-        'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start')
+        'worktree-remove' = @('--repository-root', '--worktree-path', '--worker-pid', '--worker-process-start', '--test-max-descendants')
         'probe-child-window' = @('--repository-root', '--parent-pid', '--minimum-start')
     }
     $requiredByCommand = @{
@@ -454,8 +458,12 @@ function Get-ChildProcessRecords {
             catch { throw 'worktree-holder-descendant-unverifiable' }
             finally { if (-not $accepted) { [void][Gatecraft.NativeProcess]::CloseHandle($handle) } }
         }
+        # Materialize the array BEFORE flipping $completedNormally (lived: found by external review round
+        # 19 -- the prior order set the flag first, so a throwing .ToArray() would skip cleanup below even
+        # though nothing was actually returned to a caller yet).
+        $resultArray = $records.ToArray()
         $completedNormally = $true
-        return ,$records.ToArray()
+        return ,$resultArray
     }
     finally {
         # If this function is exiting via an exception (a later CIM row was unverifiable, for example),
@@ -538,15 +546,17 @@ function Stop-DescendantProcesses {
             $toStop = [Collections.Generic.List[object]]::new()
             foreach ($knownPid in @($seenStarts.Keys)) {
                 $children = Get-ChildProcessRecords -ParentProcessId $knownPid -MinimumStart $seenStarts[$knownPid]
+                # Pin the ENTIRE batch first, in its own pass with no check that can throw, before any
+                # duplicate/bound logic runs (lived: found by external review round 19 -- round 18's fix
+                # pinned one child at a time interleaved with the throwing bound-check, so a batch of
+                # several new children could still throw partway through, leaving any child positioned
+                # AFTER the one that tripped the throw neither pinned nor closed; List.Add itself cannot
+                # meaningfully throw here, so this first pass is unconditional). Every handle
+                # Get-ChildProcessRecords ever hands back is now owned by $pinnedHandles before the second
+                # pass below can ever throw, so the enclosing function-level `finally` closes it exactly
+                # once no matter what happens next.
+                foreach ($child in $children) { $pinnedHandles.Add($child.Handle) }
                 foreach ($child in $children) {
-                    # Pin immediately, before any check below that could throw (lived: found by external
-                    # review round 18 -- a MaxCount throw partway through this loop left every not-yet-
-                    # processed handle in $children neither pinned nor closed, an unrecoverable leak). Every
-                    # handle Get-ChildProcessRecords ever hands back is now owned by $pinnedHandles the
-                    # instant we have it, so the enclosing function-level `finally` closes it exactly once
-                    # no matter what happens next. A duplicate PID's handle (already tracked from an earlier
-                    # pass) just stays pinned, redundant but harmless, until that same cleanup.
-                    $pinnedHandles.Add($child.Handle)
                     if ($seenStarts.ContainsKey($child.ProcessId)) { continue }
                     if ($seenStarts.Count -gt $MaxCount) { throw 'worktree-holder-descendants-unbounded' }
                     $seenStarts[$child.ProcessId] = $child.StartUtc
@@ -1486,6 +1496,11 @@ function Invoke-WorktreeRemove {
     if (Test-PathEqual -Left $worktreePath -Right $Context.RepositoryRoot) { throw 'worktree-path-invalid' }
     $workerPid = ConvertTo-PositivePid -Value $Options['--worker-pid']
     $workerStart = ConvertTo-CanonicalProcessStart -Value $Options['--worker-process-start']
+    # Test-only override (gated by GATECRAFT_GUARD_TEST_CONTROLS at the dispatcher, same as this file's
+    # other test-only knobs): lets a fixture cross the descendant-count bound deterministically with a
+    # handful of real processes instead of needing to spawn hundreds. Production callers never pass this;
+    # the real ceiling is always 256.
+    $maxDescendants = if ($Options.ContainsKey('--test-max-descendants')) { ConvertTo-PositivePid -Value $Options['--test-max-descendants'] } else { 256 }
 
     Assert-RegisteredWorktree -RepositoryRoot $Context.RepositoryRoot -WorktreePath $worktreePath
     if (-not [IO.Directory]::Exists($worktreePath)) { throw 'worktree-path-missing' }
@@ -1556,7 +1571,7 @@ function Invoke-WorktreeRemove {
         # Stop-DescendantProcesses, which keeps it (and every descendant's own handle) pinned open for its
         # entire run, structurally preventing this exact PID number from being reused by anything else for
         # as long as this sweep still treats it as an ancestry key (see that function's own comment).
-        [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -RootHandle $rootLifecycle.Handle -MaxCount 256 -MaxPasses 6)
+        [void](Stop-DescendantProcesses -RootProcessId $workerPid -RootStart $workerStart -RootHandle $rootLifecycle.Handle -MaxCount $maxDescendants -MaxPasses 6)
     }
 
     Assert-WorktreeCleanBeforeRemoval -WorktreePath $worktreePath
@@ -1600,7 +1615,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) { Stop-Guard -ExitCode 64 -Code 'powe
 
 try {
     $parsed = Read-GuardArguments -Tokens @($args)
-    $testOptionsPresent = @(@('--test-acquire-barrier','--test-participant','--test-timeout-ms') | Where-Object { $parsed.Values.ContainsKey($_) })
+    $testOptionsPresent = @(@('--test-acquire-barrier','--test-participant','--test-timeout-ms','--test-max-descendants') | Where-Object { $parsed.Values.ContainsKey($_) })
     if ($testOptionsPresent.Count -gt 0 -and [Environment]::GetEnvironmentVariable('GATECRAFT_GUARD_TEST_CONTROLS', [EnvironmentVariableTarget]::Process) -cne '1') { throw 'test-controls-disabled' }
     if ($parsed.Command -ceq 'probe-child-window' -and [Environment]::GetEnvironmentVariable('GATECRAFT_GUARD_TEST_CONTROLS', [EnvironmentVariableTarget]::Process) -cne '1') { throw 'test-controls-disabled' }
     $context = Get-RepositoryContext -DeclaredRoot $parsed.Values['--repository-root']
