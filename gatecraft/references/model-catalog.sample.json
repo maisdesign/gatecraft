@@ -1,7 +1,7 @@
 {
   "protocol": "gatecraft-model-catalog/v1",
-  "generated_at": "2026-07-24T00:00:00Z",
-  "source": "user-approved static catalog; cost_tier and quality_tier are proposals for review",
+  "generated_at": "2026-07-24T14:00:00Z",
+  "source": "user-approved static catalog; cost_tier/quality_tier cross-checked 2026-07-24 against published July 2026 API pricing and benchmark tiers (Claude: $1/$5 Haiku 4.5, $2-3/$10-15 Sonnet 5, $5/$25 Opus 4.8 per 1M tokens; GPT-5.6: $1/$6 Luna, $5/$30 Sol, Artificial Analysis coding index Luna=74.6 vs Sol=80) - Luna corrected from an initial cost_tier=2/quality=high proposal to cost_tier=1/quality=standard (same cost tier as Haiku, lowest quality tier of its family), all other tiers confirmed",
   "models": [
     {
       "id": "claude-haiku-4-5-20251001",
@@ -35,8 +35,8 @@
       "provider": "openai",
       "roles": ["implementer", "reviewer"],
       "thinking_levels": ["low", "medium", "high"],
-      "cost_tier": 2,
-      "quality_tier": "high",
+      "cost_tier": 1,
+      "quality_tier": "standard",
       "deprecation_state": "active"
     }
   ]
