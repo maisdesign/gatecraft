@@ -1,0 +1,43 @@
+{
+  "protocol": "gatecraft-model-catalog/v1",
+  "generated_at": "2026-07-24T00:00:00Z",
+  "source": "user-approved static catalog; cost_tier and quality_tier are proposals for review",
+  "models": [
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "provider": "anthropic",
+      "roles": ["implementer", "reviewer"],
+      "thinking_levels": ["low", "medium", "high"],
+      "cost_tier": 1,
+      "quality_tier": "standard",
+      "deprecation_state": "active"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "provider": "anthropic",
+      "roles": ["implementer", "reviewer", "sensitive-reviewer"],
+      "thinking_levels": ["low", "medium", "high"],
+      "cost_tier": 3,
+      "quality_tier": "high",
+      "deprecation_state": "active"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "provider": "anthropic",
+      "roles": ["implementer", "reviewer", "sensitive-reviewer"],
+      "thinking_levels": ["low", "medium", "high"],
+      "cost_tier": 2,
+      "quality_tier": "high",
+      "deprecation_state": "active"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "openai",
+      "roles": ["implementer", "reviewer"],
+      "thinking_levels": ["low", "medium", "high"],
+      "cost_tier": 2,
+      "quality_tier": "high",
+      "deprecation_state": "active"
+    }
+  ]
+}
