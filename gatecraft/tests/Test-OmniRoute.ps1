@@ -298,6 +298,18 @@ server.listen(port, host);
     if ($IsWindows) { Assert-True ($installPlan.Executable -cmatch '(?i)npm\.cmd$' -and $installPlan.Executable -cnotmatch '(?i)\.ps1$') 'Windows installation must use npm.cmd and never hand npm.ps1 to process launch or file association.' }
     Assert-Throws { Install-GatecraftOmniRoute -Version '3.8.49' -UserConfirmed:$false -Confirm:$false } 'direct-confirmation-required' 'Installation must require direct confirmation.'
     Assert-Throws { New-GatecraftOmniRouteInstallPlan -Version 'latest;whoami' } 'version-invalid' 'Install plan must reject command-shaped versions.'
+
+    $entryPointPath = (Resolve-Path (Join-Path $PSScriptRoot '../scripts/omniroute-session.ps1')).Path
+    $escapedEntryPoint = $entryPointPath.Replace("'", "''")
+    $escapedPwsh = (Get-Command pwsh).Source.Replace("'", "''")
+    $statusProbe = & $moduleInfo ([scriptblock]::Create("Invoke-GatecraftOmniRouteProcess -FilePath '$escapedPwsh' -Arguments @('-NoLogo', '-NoProfile', '-File', '$escapedEntryPoint', 'status') -TimeoutMilliseconds 30000"))
+    Assert-True (-not $statusProbe.TimedOut) 'GC-0.2 status discovery must complete within its bound.'
+    Assert-Equal $statusProbe.ExitCode 0 'GC-0.2 status must project an observed state even when discovery returns no startup adapter.'
+    $statusProjection = $statusProbe.Stdout | ConvertFrom-Json
+    Assert-True ($statusProjection.state -cin @('missing', 'installed-stopped', 'ready', 'broken')) 'Status must project one of the four observed states, never an empty state.'
+    Assert-True ($statusProjection.adapter -cin @('none', 'native-cli', 'docker-existing', 'source-checkout', 'desktop-application', 'user-systemd-service')) 'Status must project a resolved adapter token, never an empty adapter.'
+    Assert-True ($statusProjection.discovered_adapter_types -is [array]) 'Discovered adapter types must project as an array even when discovery is empty.'
+    Assert-True ($statusProjection.discovered_adapter_count -ge 0) 'Discovered adapter count must project as a number even when discovery is empty.'
 } finally {
     if ([IO.Directory]::Exists($tempRoot)) {
         $resolvedTemp = [IO.Path]::GetFullPath($tempRoot)

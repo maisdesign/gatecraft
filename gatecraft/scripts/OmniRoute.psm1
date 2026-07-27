@@ -906,7 +906,7 @@ function Get-GatecraftOmniRouteStatus {
     }
     $registered = Read-GatecraftOmniRouteStartupAdapter -Path $StartupAdapterPath
     $registeredPresent = $registered.Exists -and $registered.Valid
-    $discovered = if ($probe.ProbeState -cne 'ready' -and -not $registeredPresent -and -not $containerPresent -and $null -eq $native) { @(Find-GatecraftOmniRouteStartupAdapters) } else { @() }
+    $discovered = @(if ($probe.ProbeState -cne 'ready' -and -not $registeredPresent -and -not $containerPresent -and $null -eq $native) { Find-GatecraftOmniRouteStartupAdapters } else { @() })
     $state = Resolve-GatecraftOmniRouteObservedState -ProbeState $probe.ProbeState -NativeCommandPresent ($null -ne $native) -DockerContainerPresent $containerPresent -DockerContainerRunning $containerRunning -RegisteredAdapterPresent $registeredPresent -DiscoveredAdapterPresent ($discovered.Count -gt 0)
     $adapter = if ($registeredPresent) { $registered.Record.type } elseif ($containerPresent) { 'docker-existing' } elseif ($null -ne $native) { 'native-cli' } elseif ($discovered.Count -gt 0) { $discovered[0].Type } else { 'none' }
     return New-GatecraftOmniRouteResult @{
