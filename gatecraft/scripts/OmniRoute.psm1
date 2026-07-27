@@ -28,7 +28,8 @@ function Invoke-GatecraftOmniRouteProcess {
     param(
         [Parameter(Mandatory)][string] $FilePath,
         [Parameter(Mandatory)][string[]] $Arguments,
-        [ValidateRange(100, 30000)][int] $TimeoutMilliseconds = 5000
+        [string] $WorkingDirectory,
+        [ValidateRange(100, 600000)][int] $TimeoutMilliseconds = 5000
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -37,6 +38,7 @@ function Invoke-GatecraftOmniRouteProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) { $startInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory) }
     foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -1157,6 +1159,113 @@ function Build-GatecraftOmniRouteSourceCheckout {
     return New-GatecraftOmniRouteResult @{ State = 'built'; ReasonCode = 'production-build-ready'; Target = $plan.Target; RawLogDirectory = $diagnostic.RawLogDirectory }
 }
 
+function Get-GatecraftOmniRouteInstallRoot {
+    [CmdletBinding()]
+    param([string] $NpmPath)
+
+    $npm = if (-not [string]::IsNullOrWhiteSpace($NpmPath)) {
+        $NpmPath
+    } else {
+        $resolved = if ($IsWindows) {
+            Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue
+        } else {
+            Get-Command npm -CommandType Application -ErrorAction SilentlyContinue
+        }
+        if ($null -eq $resolved) { throw 'omniroute-npm-unavailable' }
+        $resolved.Source
+    }
+    if ($npm -cmatch '(?i)\.ps1$') { throw 'omniroute-npm-unavailable' }
+    $probe = Invoke-GatecraftOmniRouteProcess -FilePath $npm -Arguments @('root', '--global') -TimeoutMilliseconds 30000
+    if ($probe.TimedOut -or $probe.ExitCode -ne 0) { throw 'omniroute-npm-root-unavailable' }
+    $globalRoot = @($probe.Stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)[0]
+    if ($null -eq $globalRoot) { throw 'omniroute-npm-root-unavailable' }
+    $globalRoot = $globalRoot.Trim()
+    if (-not [IO.Directory]::Exists($globalRoot)) { throw 'omniroute-npm-root-unavailable' }
+    $packageRoot = Join-Path $globalRoot 'omniroute'
+    if (-not [IO.Directory]::Exists($packageRoot)) { throw 'omniroute-install-root-missing' }
+    return [IO.Path]::GetFullPath($packageRoot)
+}
+
+# npm 11.16+ defers install scripts it has not been told to allow, and `npm approve-scripts` refuses
+# global installs outright (EGLOBAL), so a global `npm install omniroute` exits 0 while omniroute's own
+# postinstall never ran. That postinstall only copies already-downloaded platform-native binaries into
+# the standalone bundle, so running it explicitly afterwards is idempotent and needs no build toolchain.
+function Invoke-GatecraftOmniRoutePostinstall {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string] $PackageRoot,
+        [ValidateRange(1000, 600000)][int] $TimeoutMilliseconds = 600000
+    )
+
+    $root = [IO.Path]::GetFullPath($PackageRoot)
+    if (-not [IO.Directory]::Exists($root)) { throw 'omniroute-install-root-missing' }
+    $runner = Join-Path $root 'scripts/build/postinstall.mjs'
+    if (-not [IO.File]::Exists($runner)) {
+        return New-GatecraftOmniRouteResult @{ Ran = $false; ReasonCode = 'postinstall-runner-absent'; ExitCode = 0 }
+    }
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $node) { throw 'omniroute-node-unavailable' }
+    if (-not $PSCmdlet.ShouldProcess($runner, 'Run the OmniRoute package postinstall')) {
+        return New-GatecraftOmniRouteResult @{ Ran = $false; ReasonCode = 'postinstall-declined'; ExitCode = 0 }
+    }
+    $run = Invoke-GatecraftOmniRouteProcess -FilePath $node.Source -Arguments @($runner) -WorkingDirectory $root -TimeoutMilliseconds $TimeoutMilliseconds
+    if ($run.TimedOut) { return New-GatecraftOmniRouteResult @{ Ran = $false; ReasonCode = 'postinstall-timeout'; ExitCode = -1 } }
+    $reasonCode = if ($run.ExitCode -eq 0) { 'postinstall-complete' } else { 'postinstall-failed' }
+    # The runner's own narrative is deliberately not projected or trusted: on Windows its wreq-js branch
+    # reports a false negative ("OAuth providers may not work") for a binary that is present and loads,
+    # and its output embeds user-home paths. Test-GatecraftOmniRouteInstallHealth decides instead.
+    return New-GatecraftOmniRouteResult @{ Ran = $true; ReasonCode = $reasonCode; ExitCode = $run.ExitCode }
+}
+
+function Test-GatecraftOmniRouteInstallHealth {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $PackageRoot,
+        [string] $ExpectedVersion,
+        [string[]] $NativeModules = @('better-sqlite3', 'wreq-js')
+    )
+
+    $root = [IO.Path]::GetFullPath($PackageRoot)
+    if (-not [IO.Directory]::Exists($root)) { throw 'omniroute-install-root-missing' }
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $node) { throw 'omniroute-node-unavailable' }
+    $checks = [Collections.Generic.List[object]]::new()
+    $healthy = $true
+    $reasonCode = 'install-healthy'
+
+    $native = Get-GatecraftOmniRouteNativeCommand
+    if ($null -eq $native) {
+        $healthy = $false
+        $reasonCode = 'cli-unavailable'
+        $checks.Add([pscustomobject]@{ Check = 'cli'; Scope = 'path'; Passed = $false })
+    } else {
+        $versionRun = Invoke-GatecraftOmniRouteProcess -FilePath $native.Source -Arguments @('--version') -TimeoutMilliseconds 30000
+        # Only the parsed semver is projected. The command also prints the resolved .env path, which is user-home-shaped.
+        $observedVersion = @($versionRun.Stdout -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -cmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$' } | Select-Object -First 1)[0]
+        $versionPassed = -not $versionRun.TimedOut -and $versionRun.ExitCode -eq 0 -and $null -ne $observedVersion
+        if ($versionPassed -and -not [string]::IsNullOrWhiteSpace($ExpectedVersion)) { $versionPassed = $observedVersion -ceq $ExpectedVersion }
+        $checks.Add([pscustomobject]@{ Check = 'cli'; Scope = 'path'; Passed = $versionPassed; Version = $observedVersion })
+        if (-not $versionPassed) { $healthy = $false; $reasonCode = 'cli-version-mismatch' }
+    }
+
+    # The standalone bundle under dist/ resolves its own node_modules, so a module that loads from the
+    # package root proves nothing about the runtime that actually serves /v1/models. Check both.
+    $scopes = [ordered]@{ root = $root }
+    $dist = Join-Path $root 'dist'
+    if ([IO.Directory]::Exists($dist)) { $scopes['dist'] = $dist }
+    foreach ($scopeName in $scopes.Keys) {
+        foreach ($moduleName in $NativeModules) {
+            if ($moduleName -cnotmatch '^[@A-Za-z0-9][A-Za-z0-9._/-]*$') { throw 'omniroute-health-module-invalid' }
+            $run = Invoke-GatecraftOmniRouteProcess -FilePath $node.Source -Arguments @('-e', "require('$moduleName')") -WorkingDirectory $scopes[$scopeName] -TimeoutMilliseconds 30000
+            $passed = -not $run.TimedOut -and $run.ExitCode -eq 0
+            $checks.Add([pscustomobject]@{ Check = 'native-module'; Scope = $scopeName; Module = $moduleName; Passed = $passed })
+            if (-not $passed) { $healthy = $false; $reasonCode = 'native-module-unloadable' }
+        }
+    }
+
+    return New-GatecraftOmniRouteResult @{ Healthy = $healthy; ReasonCode = $reasonCode; PackageRoot = $root; Checks = @($checks) }
+}
+
 function Install-GatecraftOmniRoute {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
@@ -1171,7 +1280,21 @@ function Install-GatecraftOmniRoute {
     if ($LASTEXITCODE -ne 0) { throw "omniroute-install-failed:$LASTEXITCODE" }
     $installed = Get-GatecraftOmniRouteNativeCommand
     if ($null -eq $installed) { throw 'omniroute-install-verification-failed' }
-    return New-GatecraftOmniRouteResult @{ Installed = $true; Version = $Version; Command = $installed.Source }
+    $packageRoot = Get-GatecraftOmniRouteInstallRoot -NpmPath $plan.Executable
+    $postinstall = Invoke-GatecraftOmniRoutePostinstall -PackageRoot $packageRoot -Confirm:$false
+    $health = Test-GatecraftOmniRouteInstallHealth -PackageRoot $packageRoot -ExpectedVersion $Version
+    if (-not $health.Healthy) { throw "omniroute-install-health-failed:$($health.ReasonCode)" }
+    return New-GatecraftOmniRouteResult @{
+        Installed = $true
+        Version = $Version
+        Command = $installed.Source
+        PackageRoot = $packageRoot
+        PostinstallRan = $postinstall.Ran
+        PostinstallReasonCode = $postinstall.ReasonCode
+        PostinstallExitCode = $postinstall.ExitCode
+        Healthy = $true
+        Checks = $health.Checks
+    }
 }
 
 Export-ModuleMember -Function @(
@@ -1194,6 +1317,9 @@ Export-ModuleMember -Function @(
     'Resolve-GatecraftOmniRouteInstallDecision',
     'Test-GatecraftOmniRouteEndpoint',
     'Resolve-GatecraftOmniRouteObservedState',
+    'Get-GatecraftOmniRouteInstallRoot',
+    'Invoke-GatecraftOmniRoutePostinstall',
+    'Test-GatecraftOmniRouteInstallHealth',
     'Get-GatecraftOmniRouteStatus',
     'Start-GatecraftOmniRoute',
     'Test-GatecraftOmniRouteLoopbackListener',

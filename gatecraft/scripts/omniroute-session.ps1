@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install')]
+    [ValidateSet('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install', 'install-health')]
     [string] $Command,
 
     [string] $Endpoint,
@@ -40,7 +40,7 @@ try {
     $adapterArguments = @{}
     if (-not [string]::IsNullOrWhiteSpace($StartupAdapterPath)) { $adapterArguments.Path = $StartupAdapterPath }
     $preferences = Read-GatecraftOmniRoutePreferences @preferenceArguments
-    $invalidPreferenceFallbackCommands = @('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan')
+    $invalidPreferenceFallbackCommands = @('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan', 'install-health')
     if (-not $preferences.Valid -and $Command -cnotin $invalidPreferenceFallbackCommands) { throw 'omniroute-preferences-invalid' }
     $effectiveEndpoint = if (-not [string]::IsNullOrWhiteSpace($Endpoint)) { $Endpoint } elseif ($preferences.Valid) { $preferences.Endpoint } else { 'http://localhost:20128' }
 
@@ -133,6 +133,10 @@ try {
         'install' {
             Require-Value $Version 'Version'
             Install-GatecraftOmniRoute -Version $Version -UserConfirmed:$UserConfirmed.IsPresent -Confirm:$false
+        }
+        'install-health' {
+            $healthRoot = if (-not [string]::IsNullOrWhiteSpace($Target)) { $Target } else { Get-GatecraftOmniRouteInstallRoot }
+            Test-GatecraftOmniRouteInstallHealth -PackageRoot $healthRoot -ExpectedVersion $Version
         }
     }
     $result | ConvertTo-Json -Depth 12
