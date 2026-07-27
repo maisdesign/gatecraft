@@ -60,7 +60,7 @@ try {
                 registered_adapter_exists = $status.StartupAdapter.Exists
                 registered_adapter_valid = $status.StartupAdapter.Valid
                 discovered_adapter_count = $status.DiscoveredAdapters.Count
-                discovered_adapter_types = @($status.DiscoveredAdapters.Type | Sort-Object -Unique)
+                discovered_adapter_types = @($status.DiscoveredAdapters | ForEach-Object { $_.Type } | Sort-Object -Unique)
                 preferences_valid = $preferences.Valid
                 preference_reason = $preferences.ReasonCode
                 runtime_protocol = $runtimeIdentity.Protocol
