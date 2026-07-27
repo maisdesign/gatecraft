@@ -299,6 +299,32 @@ server.listen(port, host);
     Assert-Throws { Install-GatecraftOmniRoute -Version '3.8.49' -UserConfirmed:$false -Confirm:$false } 'direct-confirmation-required' 'Installation must require direct confirmation.'
     Assert-Throws { New-GatecraftOmniRouteInstallPlan -Version 'latest;whoami' } 'version-invalid' 'Install plan must reject command-shaped versions.'
 
+    $installProbeRoot = Join-Path $tempRoot 'install-probe'
+    [IO.Directory]::CreateDirectory($installProbeRoot) | Out-Null
+    $absentPostinstall = Invoke-GatecraftOmniRoutePostinstall -PackageRoot $installProbeRoot -Confirm:$false
+    Assert-True (-not $absentPostinstall.Ran) 'A package without a postinstall runner must report that it did not run.'
+    Assert-Equal $absentPostinstall.ReasonCode 'postinstall-runner-absent' 'A missing postinstall runner must be a named reason, not a failure.'
+    [IO.Directory]::CreateDirectory((Join-Path $installProbeRoot 'scripts/build')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $installProbeRoot 'scripts/build/postinstall.mjs'), "process.exit(0)`n")
+    $declinedPostinstall = Invoke-GatecraftOmniRoutePostinstall -PackageRoot $installProbeRoot -WhatIf 6>$null
+    Assert-True (-not $declinedPostinstall.Ran) 'Postinstall must not run when the caller declines it.'
+    Assert-Equal $declinedPostinstall.ReasonCode 'postinstall-declined' 'A declined postinstall must be distinguishable from an absent one.'
+    $ranPostinstall = Invoke-GatecraftOmniRoutePostinstall -PackageRoot $installProbeRoot -Confirm:$false
+    Assert-True ($ranPostinstall.Ran -and $ranPostinstall.ExitCode -eq 0) 'An explicitly confirmed postinstall must run and report its real exit code.'
+    Assert-Equal $ranPostinstall.ReasonCode 'postinstall-complete' 'A zero-exit postinstall must be reported as complete.'
+    [IO.File]::WriteAllText((Join-Path $installProbeRoot 'scripts/build/postinstall.mjs'), "process.exit(3)`n")
+    $failedPostinstall = Invoke-GatecraftOmniRoutePostinstall -PackageRoot $installProbeRoot -Confirm:$false
+    Assert-Equal $failedPostinstall.ExitCode 3 'A failing postinstall must surface its real exit code.'
+    Assert-Equal $failedPostinstall.ReasonCode 'postinstall-failed' 'A nonzero postinstall must not be reported as complete.'
+    Assert-Throws { Invoke-GatecraftOmniRoutePostinstall -PackageRoot (Join-Path $tempRoot 'no-such-install') -Confirm:$false } 'install-root-missing' 'Postinstall must refuse a package root that does not exist.'
+
+    $unhealthy = Test-GatecraftOmniRouteInstallHealth -PackageRoot $installProbeRoot -NativeModules @('better-sqlite3')
+    Assert-True (-not $unhealthy.Healthy) 'A package root whose native modules cannot be required must never be reported healthy.'
+    Assert-True (@($unhealthy.Checks | Where-Object { $_.Check -ceq 'native-module' -and -not $_.Passed }).Count -gt 0) 'Health must record the specific native module that failed to load.'
+    Assert-Throws { Test-GatecraftOmniRouteInstallHealth -PackageRoot $installProbeRoot -NativeModules @("x'); process.exit(0); ('") } 'health-module-invalid' 'Health checks must reject command-shaped module names instead of interpolating them into node -e.'
+    Assert-Throws { Test-GatecraftOmniRouteInstallHealth -PackageRoot (Join-Path $tempRoot 'no-such-install') } 'install-root-missing' 'Health checks must refuse a package root that does not exist.'
+    Assert-Throws { Get-GatecraftOmniRouteInstallRoot -NpmPath 'C:\shim\npm.ps1' } 'npm-unavailable' 'Install-root resolution must never hand a .ps1 wrapper to process launch.'
+
     $entryPointPath = (Resolve-Path (Join-Path $PSScriptRoot '../scripts/omniroute-session.ps1')).Path
     $escapedEntryPoint = $entryPointPath.Replace("'", "''")
     $escapedPwsh = (Get-Command pwsh).Source.Replace("'", "''")

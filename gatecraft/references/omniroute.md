@@ -53,6 +53,28 @@ When the observed state is `missing`, call `Resolve-GatecraftOmniRouteInstallDec
 
 The helper uses the official npm package and includes optional native dependencies. It rejects an unpinned or command-shaped version. On Windows it resolves the application shims explicitly as `npm.cmd` and `omniroute.exe|omniroute.cmd`; it never passes a `.ps1` wrapper to process launch or to the OS file-association handler. Do not auto-update OmniRoute during orchestration, install a Docker image, modify a service, or select a different installer without a separate direct user decision.
 
+## Completing the installation
+
+`npm install --global` is not the whole installation on npm 11.16 and later. npm defers every install script it has not been told to allow, exits 0 anyway, and prints only a warning; for OmniRoute that silently skips its own postinstall plus roughly a dozen native dependencies. Neither documented remedy applies to the scope Gatecraft uses: `npm approve-scripts` refuses global installs with `EGLOBAL`, and `--allow-scripts=<pkg>` is not a valid `install` flag. Treating npm's exit code as success therefore reports a half-installed package as installed (lived, on the first real install this contract was exercised).
+
+`Install-GatecraftOmniRoute` closes that gap inside the single install confirmation the user already gave — a confirmation to install means a confirmation to install something that works, not to stop halfway. After npm exits it resolves the global package root from `npm root --global`, runs `Invoke-GatecraftOmniRoutePostinstall`, and then requires `Test-GatecraftOmniRouteInstallHealth` to pass before returning. An unhealthy result throws `omniroute-install-health-failed:<reason>` instead of returning `Installed=$true`. Do not add a second prompt for the postinstall: it only copies already-downloaded platform-native binaries into the standalone bundle, needs no build toolchain, and is idempotent.
+
+Never trust the postinstall's own narrative. On Windows its `wreq-js` branch prints a false-negative warning that OAuth-based providers may not work, and recommends a `cd dist && npm install wreq-js --no-save` that fails with `ERESOLVE`, when the `win32-x64-msvc` binary is in fact present and loads. Its output also embeds user-home paths. Gatecraft records only the runner's exit code and a fixed reason code, and decides health separately.
+
+Health means all of: the resolved `omniroute.exe|omniroute.cmd` shim reports the exact installed version, and each native module (`better-sqlite3` for local state, `wreq-js` for the TLS client the OAuth providers use) loads **from both the package root and the standalone `dist/` tree**. The bundle resolves its own `node_modules`, so a module that loads from the root proves nothing about the runtime that actually serves `/v1/models`. Only the parsed semver is projected — the CLI also prints its resolved `.env` path, which is user-home-shaped. `install-health` is available as a standalone entry-point command so a later session can re-check an existing installation without reinstalling it.
+
+## Provider onboarding is the user's own, always
+
+The point of the gateway is a larger pool of workers: free-tier provider tokens alongside whatever paid or local accounts multi-CLI already discovered. Gatecraft takes that pool exactly as far as it can honestly go, and stops at a fixed line.
+
+Gatecraft may: install and health-check OmniRoute, start it under the normal consent rules, open or name the local dashboard, read `/v1/models` to observe which providers actually answer, and report the gap between the models the catalog expects and the models the endpoint offers.
+
+Gatecraft must never, on the user's behalf: create an account with any provider, complete a signup or OAuth consent screen, enter a password, solve a bot check, accept provider terms, or handle, transcribe, or store an API key. This is not a limitation of the current implementation and must not be "fixed" later. Automated signup violates essentially every provider's terms and would put the user's identity behind a credential they never saw; an OAuth consent screen is the one place the user, not an agent, authorizes access.
+
+Provider credentials therefore never enter a Gatecraft repository, a bead, a receipt, a dashboard, a dispatch prompt, or a process command line. **A Gatecraft checkout is published; a key committed to it is a key disclosed.** OmniRoute keeps provider credentials in its own local store beside its `.env`, outside any repository Gatecraft orchestrates, and Gatecraft neither reads nor copies them. If a user asks Gatecraft to save keys "in the project", refuse and explain where they actually belong.
+
+The supported onboarding is therefore: Gatecraft reaches a `ready` endpoint, tells the user the dashboard origin, and the user connects providers there themselves. OmniRoute ships a default `INITIAL_PASSWORD=CHANGEME`; surface that as the non-secret `default-initial-password` warning and have the user change it during that same attended pass. Afterwards Gatecraft re-reads `/v1/models` and reports the resulting worker pool as availability evidence — never as catalog authority, per the routing rules below.
+
 ## Use decision
 
 When OmniRoute is present, or immediately after verified installation, offer these attended choices whenever the resolved policy is `ask`:
