@@ -22,6 +22,8 @@ The stale threshold is exactly 72 hours from `generated_at`. Evaluate it once wh
 
 Per-launch availability is separate from catalog freshness. Before a launch, verify that the named profile can actually start with the selected model and thinking level. An unsupported or rejected setting is a launch failure, not permission to substitute defaults.
 
+When the optional OmniRoute session gateway is active, its validated live `/v1/models` IDs are only another per-launch availability source. They do not supply trusted role eligibility, cost/quality tiers, thinking support, deprecation state, or sensitive-review suitability and therefore never replace this record. An automatic OmniRoute route is selectable only when its exact route ID is represented in this validated catalog for the ordinary implementer role; reviewers and sensitive reviewers require an explicit approved effective model as specified in `omniroute.md`.
+
 ## Selection and evidence
 
 The orchestrator chooses worker/reviewer settings, not the human's own orchestrator settings. It must record only sanitized fields: catalog protocol/version, freshness state, source kind, selected model ID, selected thinking level, role, decision reason codes, and availability outcome. Retain the local catalog under the normal restricted local-state policy; never commit it or publish raw provider data.

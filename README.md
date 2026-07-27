@@ -60,6 +60,7 @@ gatecraft/                       # the installable unit — copy this whole fold
 │  ├─ cycle-end.md               # receipt-first cycle-end event and recovery contract
 │  ├─ receipt-protocol.md        # verification/v2 receipts, hashing, review, retry rules
 │  ├─ recovery-protocol.md       # attended external-merge audit; permanently non-qualifying
+│  ├─ omniroute.md               # optional session gateway onboarding, policy, and safety rules
 │  ├─ evidence-hygiene.md        # raw-local → sanitized durable/public boundary
 │  ├─ dispatch-template.md       # the fill-every-field worker prompt
 │  ├─ anti-patterns.md           # lived failures → the rules that prevent them
@@ -70,6 +71,9 @@ gatecraft/                       # the installable unit — copy this whole fold
 │  └─ wordpress.md               # WordPress env checklist + Windows sandbox incident
 ├─ scripts/
 │  ├─ Gatecraft.Protocol.psm1    # deterministic parser, validator, hasher, sanitizer, retry state
+│  ├─ OmniRoute.psm1             # preference, discovery, readiness, start, and install-consent helpers
+│  ├─ omniroute-session.ps1       # JSON runtime entry point invoked by per-session GC-0.2
+│  ├─ omniroute-process-host.ps1  # bounded/redacted source startup and build process host
 │  ├─ guard.ps1 / guard.sh       # PowerShell 7 + POSIX/Git-Bash local guard entry points
 │  ├─ cycle-end.ps1              # PowerShell 7 receipt-first cycle-end entry point
 │  └─ cycle-end.sh               # POSIX/Git-Bash argument-preserving entry point
@@ -78,6 +82,7 @@ gatecraft/                       # the installable unit — copy this whole fold
    ├─ Test-CycleEnd.ps1          # idempotency, conflict, kill/replay, and shell-parity gate
    ├─ Test-ReceiptProtocol.ps1   # real-module verification/review/retry behavioral gate
    ├─ Test-RecoveryProtocol.ps1  # attended audit and non-qualification behavioral gate
+   ├─ Test-OmniRoute.ps1         # optional-gateway policy, discovery, and consent gate
    ├─ Test-All.ps1               # fail-fast integrated runner for every Gatecraft gate
    └─ Test-ProtocolContract.ps1  # dependency-free protocol acceptance gate
 INSTALL.md                       # single- and multi-profile install instructions
@@ -98,6 +103,12 @@ Restart open sessions. No alias, no second file to install — the folder name *
 
 Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with multi-cli", "dispatch to codex/claude/antigravity"*. The first run walks through **Step 0 (bootstrap)**: it checks/installs `bd`, discovers the profiles actually present, smoke-tests write capability, and asks you to set the standing autonomy, succession, and push policies before any bead is dispatched.
 
+### Optional OmniRoute gateway
+
+At the start of every orchestration session Gatecraft can discover [OmniRoute](https://github.com/diegosouzapw/OmniRoute) and offer it as an optional routing/compression layer. Gatecraft still works normally without it. If OmniRoute is missing, attended onboarding can offer a pinned official npm installation, ask again next time, or remember never to ask. If it is present, the user can enable it for this session, always for the current project, always with Gatecraft, skip it this session, or disable it for the current project.
+
+Gatecraft persists user intent, not an `installed` boolean: actual endpoint/adapter state is rechecked every session. Project choices stay in local Git config, global choices stay in local user configuration, and session choices stay in memory. A typed startup registry covers native CLI, Docker, validated official source checkouts, desktop apps, and user services without persisting arbitrary shell commands. A modified official source checkout is still detected, but can only be started once after direct confirmation and is never stored as standing startup authority. Source mode is preflighted: an unbuilt checkout recommends `dev`, while `start` requires a production build and never silently changes mode. Managed source startup forces and verifies loopback binding and reports bounded sanitized diagnostics; building is a separate hash-bound confirmation. Activation uses bounded readiness checks, does not rewrite ordinary Claude/Codex configuration, and falls back to direct profiles when the optional gateway is unavailable. Review models remain explicit where model identity matters, and protocol fields, exact commands, receipts, and verification evidence are never eligible for compression. See [the OmniRoute integration contract](gatecraft/references/omniroute.md).
+
 ### Requirements
 
 - a git repository
@@ -105,7 +116,7 @@ Invoke `/gatecraft`, or just ask in plain language — *"orchestrate this with m
 - a real shell (Claude Code CLI or its VS Code extension, or an equivalent shell-capable environment)
 - PowerShell 7 (`pwsh`) and Git; on Windows shell-parity testing uses Git for Windows Bash
 
-`bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything.
+`bd` and the multi-CLI profile tooling are **not** required in advance — Step 0 detects them and asks before installing anything. OmniRoute is never required.
 
 ### Maintenance
 
@@ -117,6 +128,7 @@ pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-OmniRoute.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 git diff --check
 git add -- <intended-paths>
@@ -173,6 +185,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 │  ├─ cycle-end.md               # evento cycle-end receipt-first e contratto di ripristino
 │  ├─ receipt-protocol.md        # ricevute verification/v2, hash, review e retry
 │  ├─ recovery-protocol.md       # audit attended di merge esterni; mai qualificante
+│  ├─ omniroute.md               # onboarding, policy e sicurezza del gateway opzionale di sessione
 │  ├─ evidence-hygiene.md        # confine raw locale → durevole/pubblico sanitizzato
 │  ├─ dispatch-template.md       # prompt worker con ogni campo da compilare
 │  ├─ anti-patterns.md           # fallimenti vissuti → regole preventive
@@ -183,6 +196,9 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
 │  └─ wordpress.md               # checklist WordPress + incidente sandbox Windows
 ├─ scripts/
 │  ├─ Gatecraft.Protocol.psm1    # parser, validatore, hash, sanitizzazione e retry deterministici
+│  ├─ OmniRoute.psm1             # helper per preferenze, discovery, readiness, avvio e consenso installazione
+│  ├─ omniroute-session.ps1       # entry point JSON invocato dal GC-0.2 a ogni sessione
+│  ├─ omniroute-process-host.ps1  # process host bounded/sanitizzato per avvio e build sorgente
 │  ├─ guard.ps1 / guard.sh       # entry point PowerShell 7 + POSIX/Git-Bash del guard locale
 │  ├─ cycle-end.ps1              # entry point receipt-first per PowerShell 7
 │  └─ cycle-end.sh               # entry point POSIX/Git-Bash che preserva gli argomenti
@@ -191,6 +207,7 @@ gatecraft/                       # l'unità installabile — copia l'intera cart
    ├─ Test-CycleEnd.ps1          # gate idempotenza, conflitti, kill/replay e parità shell
    ├─ Test-ReceiptProtocol.ps1   # gate comportamentale sul modulo reale
    ├─ Test-RecoveryProtocol.ps1  # gate audit attended e non qualificazione
+   ├─ Test-OmniRoute.ps1         # gate policy, discovery e consenso del gateway opzionale
    ├─ Test-All.ps1               # runner integrato fail-fast per tutti i gate Gatecraft
    └─ Test-ProtocolContract.ps1  # gate del protocollo senza dipendenze
 INSTALL.md                       # istruzioni di installazione mono e multi-profilo
@@ -211,6 +228,12 @@ Riavvia le sessioni aperte. Nessun alias, nessun secondo file da installare — 
 
 Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this with multi-cli", "dispatch to codex/claude/antigravity"*. La prima esecuzione attraversa lo **Step 0 (bootstrap)**: controlla/installa `bd`, scopre i profili realmente presenti, fa uno smoke-test di scrittura e ti chiede di fissare le policy permanenti di autonomia, successione e push prima che venga dispatchato qualsiasi bead.
 
+### Gateway OmniRoute opzionale
+
+All'inizio di ogni sessione di orchestrazione Gatecraft può rilevare [OmniRoute](https://github.com/diegosouzapw/OmniRoute) e proporlo come livello opzionale di routing e compressione. Gatecraft continua a funzionare normalmente senza OmniRoute. Se manca, l'onboarding attended può proporre un'installazione npm ufficiale e vincolata a una versione esatta, chiedere nuovamente alla prossima sessione oppure ricordare di non chiederlo più. Se è presente, l'utente può abilitarlo solo per la sessione, sempre nel progetto corrente, sempre con Gatecraft, saltarlo per la sessione oppure disabilitarlo nel progetto corrente.
+
+Gatecraft persiste l'intenzione dell'utente, non un booleano `installed`: lo stato reale di endpoint e adapter viene ricontrollato a ogni sessione. Le scelte di progetto restano nella configurazione Git locale, quelle globali nella configurazione locale dell'utente e quelle di sessione solo in memoria. Un registro di startup tipizzato copre CLI nativa, Docker, checkout sorgente ufficiali validati, app desktop e servizi utente senza conservare comandi shell arbitrari. Anche un checkout sorgente ufficiale modificato viene rilevato, ma può essere avviato una sola volta dopo conferma diretta e non viene mai salvato come autorità di avvio permanente. La modalità sorgente viene verificata prima dell'avvio: un checkout senza build raccomanda `dev`, mentre `start` richiede una build di produzione e non cambia mai modalità silenziosamente. L'avvio sorgente gestito forza e verifica il binding loopback e restituisce diagnostica limitata e sanitizzata; la build richiede una conferma separata vincolata agli hash. L'attivazione usa readiness check con timeout, non riscrive la configurazione ordinaria di Claude/Codex e torna ai profili diretti quando il gateway opzionale non è disponibile. I modelli di review restano espliciti quando l'identità del modello è rilevante; campi di protocollo, comandi esatti, receipt ed evidenze di verifica non sono mai comprimibili. Vedi [il contratto d'integrazione OmniRoute](gatecraft/references/omniroute.md).
+
 ### Requisiti
 
 - un repository git
@@ -218,7 +241,7 @@ Invoca `/gatecraft`, oppure chiedi in linguaggio naturale — *"orchestrate this
 - una shell reale (Claude Code CLI o la sua estensione VS Code, o un ambiente equivalente con shell)
 - PowerShell 7 (`pwsh`) e Git; su Windows il test di parità usa Bash di Git for Windows
 
-`bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa.
+`bd` e il tooling multi-CLI **non** servono in anticipo — lo Step 0 li rileva e chiede prima di installare qualsiasi cosa. OmniRoute non è mai obbligatorio.
 
 ### Manutenzione
 
@@ -230,6 +253,7 @@ pwsh -NoProfile -File gatecraft/tests/Test-Guard.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ReceiptProtocol.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol.ps1
+pwsh -NoProfile -File gatecraft/tests/Test-OmniRoute.ps1
 pwsh -NoProfile -File gatecraft/tests/Test-ProtocolContract.ps1
 git diff --check
 git add -- <percorsi-intenzionali>
