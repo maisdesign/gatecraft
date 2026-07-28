@@ -1035,6 +1035,7 @@ function Test-GatecraftOmniRouteModelLane {
     $uri = $Endpoint.TrimEnd('/') + '/v1/messages'
     $body = New-GatecraftOmniRouteLaneProbeBody -ModelId $ModelId
     $status = $null
+    $failureText = ''
     try {
         if ($null -ne $Request) {
             $status = & $Request $uri $body $TimeoutSeconds
@@ -1046,6 +1047,12 @@ function Test-GatecraftOmniRouteModelLane {
         }
     } catch {
         $status = Get-GatecraftOmniRouteResponseStatus -ErrorRecord $_
+        # The message is needed to tell one 5xx apart from another: OmniRoute's own
+        # queue rejection arrives as a 502 that says nothing about the model. ErrorDetails
+        # is absent on most failures, and reading through it unguarded throws under
+        # Set-StrictMode.
+        $errorDetailsText = if ($null -ne $_.ErrorDetails) { [string] $_.ErrorDetails.Message } else { '' }
+        $failureText = "$($_.Exception.Message) $errorDetailsText"
         if ($null -eq $status) {
             # No status at all: transport failure or timeout. Never a permanent verdict.
             return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'transient'; ReasonCode = 'lane-unreachable'; HttpStatus = $null }
@@ -1059,6 +1066,14 @@ function Test-GatecraftOmniRouteModelLane {
         # The caller's key is wrong, which says nothing about the model. Reporting this
         # per-model would blacklist every lane over one bad credential.
         return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'blocked'; ReasonCode = 'probe-unauthorized'; HttpStatus = $status }
+    }
+    # OmniRoute drops a request that waited longer than its own local rate-limit queue
+    # budget, and reports it as a 502 that looks like an upstream fault. The default
+    # budget is 15s, which is tight for a free tier where a worker-sized request
+    # routinely takes longer — so the lane looks broken when only that budget is.
+    # Naming it separately turns an opaque 502 into an actionable setting.
+    if ($failureText -match 'maxWaitMs' -or $failureText -match 'rate-limit queue budget') {
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'transient'; ReasonCode = 'lane-queue-budget'; HttpStatus = $status }
     }
     if ($status -in @(408, 425, 429) -or $status -ge 500) {
         # Rate limit, cooldown or upstream fault: retryable, so it must never become a
