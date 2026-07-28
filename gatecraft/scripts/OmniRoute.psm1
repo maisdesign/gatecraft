@@ -966,6 +966,109 @@ function Resolve-GatecraftOmniRouteObservedState {
     return 'missing'
 }
 
+function New-GatecraftOmniRouteLaneProbeBody {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $ModelId)
+
+    # A gateway route that answers a one-line request can still be unusable as a
+    # worker lane. Two observed rejections only appear at realistic size and shape:
+    # a free tier that caps the per-request payload (HTTP 413 "Request too large"),
+    # and a model that refuses the reasoning parameter the anthropic launch adapter
+    # always sends (HTTP 400 "reasoning_effort is not enabled/supported"). A small
+    # ping misses both and reports the lane as good.
+    #
+    # This body therefore approximates a worker session: reasoning enabled, a long
+    # system prompt, and a realistic number of tool definitions. It is the size and
+    # shape that matter, not the wording, so the filler is deliberately inert and
+    # carries no repository content.
+    $filler = ('Operates as a coding agent inside a repository. ' * 300)
+    $tools = @(
+        0..19 | ForEach-Object {
+            [ordered]@{
+                name = "probe_tool_$_"
+                description = ('Performs one agent operation. ' * 40)
+                input_schema = [ordered]@{
+                    type = 'object'
+                    properties = [ordered]@{
+                        path = [ordered]@{ type = 'string'; description = ('absolute file path ' * 10) }
+                        content = [ordered]@{ type = 'string'; description = ('content to write ' * 10) }
+                        pattern = [ordered]@{ type = 'string'; description = ('regular expression ' * 10) }
+                    }
+                    required = @('path')
+                }
+            }
+        }
+    )
+    return [ordered]@{
+        model = $ModelId
+        max_tokens = 16
+        thinking = [ordered]@{ type = 'enabled'; budget_tokens = 1024 }
+        system = $filler
+        tools = @($tools)
+        messages = @([ordered]@{ role = 'user'; content = 'ok' })
+    }
+}
+
+function Test-GatecraftOmniRouteModelLane {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Endpoint,
+        [Parameter(Mandatory)][string] $ModelId,
+        [ValidateRange(5, 600)][int] $TimeoutSeconds = 120,
+        # Test seam: receives the request URI, body and timeout, and returns either
+        # the HTTP status code or throws like the real transport would.
+        [scriptblock] $Request
+    )
+
+    if (-not (Test-GatecraftOmniRouteEndpointUri -Endpoint $Endpoint)) {
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'invalid'; ReasonCode = 'endpoint-invalid'; HttpStatus = $null }
+    }
+
+    # The key is read from the inherited environment and never persisted, logged or
+    # projected — the contract allows an inherited secret supplied by the user, and
+    # nothing else.
+    $apiKey = if (-not [string]::IsNullOrWhiteSpace($env:OMNIROUTE_API_KEY)) { $env:OMNIROUTE_API_KEY } else { $env:ANTHROPIC_AUTH_TOKEN }
+    if ($null -eq $Request -and [string]::IsNullOrWhiteSpace($apiKey)) {
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'blocked'; ReasonCode = 'probe-key-missing'; HttpStatus = $null }
+    }
+
+    $uri = $Endpoint.TrimEnd('/') + '/v1/messages'
+    $body = New-GatecraftOmniRouteLaneProbeBody -ModelId $ModelId
+    $status = $null
+    try {
+        if ($null -ne $Request) {
+            $status = & $Request $uri $body $TimeoutSeconds
+        } else {
+            $response = Invoke-WebRequest -Method Post -Uri $uri -TimeoutSec $TimeoutSeconds -ErrorAction Stop `
+                -Headers @{ 'x-api-key' = $apiKey; 'anthropic-version' = '2023-06-01' } `
+                -ContentType 'application/json' -Body ($body | ConvertTo-Json -Depth 8 -Compress)
+            $status = [int] $response.StatusCode
+        }
+    } catch {
+        $status = Get-GatecraftOmniRouteResponseStatus -ErrorRecord $_
+        if ($null -eq $status) {
+            # No status at all: transport failure or timeout. Never a permanent verdict.
+            return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'transient'; ReasonCode = 'lane-unreachable'; HttpStatus = $null }
+        }
+    }
+
+    if ($status -ge 200 -and $status -lt 300) {
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $true; Verdict = 'permanent'; ReasonCode = 'lane-usable'; HttpStatus = $status }
+    }
+    if ($status -in @(401, 403)) {
+        # The caller's key is wrong, which says nothing about the model. Reporting this
+        # per-model would blacklist every lane over one bad credential.
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'blocked'; ReasonCode = 'probe-unauthorized'; HttpStatus = $status }
+    }
+    if ($status -in @(408, 425, 429) -or $status -ge 500) {
+        # Rate limit, cooldown or upstream fault: retryable, so it must never become a
+        # permanent exclusion. Observed live as 429 "all credentials are cooling down"
+        # on a lane that works minutes later.
+        return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'transient'; ReasonCode = 'lane-indeterminate'; HttpStatus = $status }
+    }
+    return New-GatecraftOmniRouteResult @{ ModelId = $ModelId; Usable = $false; Verdict = 'permanent'; ReasonCode = 'lane-rejected'; HttpStatus = $status }
+}
+
 function Test-GatecraftOmniRouteInstanceUnconfigured {
     [CmdletBinding()]
     param(
@@ -1580,6 +1683,8 @@ Export-ModuleMember -Function @(
     'Test-GatecraftOmniRouteInstallHealth',
     'Get-GatecraftOmniRouteStatus',
     'Test-GatecraftOmniRouteInstanceUnconfigured',
+    'Test-GatecraftOmniRouteModelLane',
+    'New-GatecraftOmniRouteLaneProbeBody',
     'Get-GatecraftOmniRouteDashboardUrl',
     'Get-GatecraftOmniRouteOnboarding',
     'Start-GatecraftOmniRoute',

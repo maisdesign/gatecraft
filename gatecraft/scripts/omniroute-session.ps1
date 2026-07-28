@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('status', 'onboarding', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install', 'install-health')]
+    [ValidateSet('status', 'onboarding', 'probe-models', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install', 'install-health')]
     [string] $Command,
 
     [string] $Endpoint,
@@ -22,6 +22,9 @@ param(
     [string] $ExpectedNodeSha256,
     [switch] $UserConfirmed,
     [switch] $IncludeModelIds,
+    [string[]] $ModelIds,
+    [ValidateRange(0, 30000)][int] $ProbePauseMilliseconds = 1500,
+    [ValidateRange(5, 600)][int] $ProbeTimeoutSeconds = 120,
     [ValidateRange(5, 180)][int] $ReadyTimeoutSeconds = 60,
     [ValidateRange(60, 1800)][int] $BuildTimeoutSeconds = 900
 )
@@ -40,7 +43,7 @@ try {
     $adapterArguments = @{}
     if (-not [string]::IsNullOrWhiteSpace($StartupAdapterPath)) { $adapterArguments.Path = $StartupAdapterPath }
     $preferences = Read-GatecraftOmniRoutePreferences @preferenceArguments
-    $invalidPreferenceFallbackCommands = @('status', 'onboarding', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan', 'install-health')
+    $invalidPreferenceFallbackCommands = @('status', 'onboarding', 'probe-models', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan', 'install-health')
     if (-not $preferences.Valid -and $Command -cnotin $invalidPreferenceFallbackCommands) { throw 'omniroute-preferences-invalid' }
     $effectiveEndpoint = if (-not [string]::IsNullOrWhiteSpace($Endpoint)) { $Endpoint } elseif ($preferences.Valid) { $preferences.Endpoint } else { 'http://localhost:20128' }
 
@@ -119,6 +122,40 @@ try {
                 configuration_owner = $onboarding.ConfigurationOwner
                 install_prompt = $installPrompt
                 preferences_valid = $preferences.Valid
+            }
+        }
+        'probe-models' {
+            if ($null -eq $ModelIds -or @($ModelIds).Count -eq 0) { throw 'omniroute-argument-required:ModelIds' }
+            # Deliberately serial and paced. Each probe sends a worker-sized request, and
+            # on a free tier one can take minutes; firing them in parallel is the fastest
+            # way to trip the very rate limits the probe is trying to measure. The caller
+            # must warn the user before starting: this is slow by design.
+            $probed = [Collections.Generic.List[object]]::new()
+            $first = $true
+            foreach ($candidate in @($ModelIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                if (-not $first) { Start-Sleep -Milliseconds $ProbePauseMilliseconds }
+                $first = $false
+                $lane = Test-GatecraftOmniRouteModelLane -Endpoint $effectiveEndpoint -ModelId $candidate -TimeoutSeconds $ProbeTimeoutSeconds
+                $probed.Add([pscustomobject][ordered]@{
+                    model_id = $lane.ModelId
+                    usable = $lane.Usable
+                    verdict = $lane.Verdict
+                    reason_code = $lane.ReasonCode
+                    http_status = $lane.HttpStatus
+                })
+                if ($lane.ReasonCode -ceq 'probe-unauthorized' -or $lane.ReasonCode -ceq 'probe-key-missing') {
+                    # The credential, not the model, is the problem: continuing would label
+                    # every remaining lane unusable for the same wrong reason.
+                    break
+                }
+            }
+            [pscustomobject][ordered]@{
+                endpoint_origin = $effectiveEndpoint
+                probed = @($probed)
+                usable = @($probed | Where-Object { $_.usable } | ForEach-Object { $_.model_id })
+                rejected = @($probed | Where-Object { -not $_.usable -and $_.verdict -ceq 'permanent' } | ForEach-Object { $_.model_id })
+                indeterminate = @($probed | Where-Object { $_.verdict -ceq 'transient' } | ForEach-Object { $_.model_id })
+                aborted = ($probed.Count -lt @($ModelIds).Count)
             }
         }
         'get-preferences' { $preferences }
