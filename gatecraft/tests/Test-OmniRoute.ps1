@@ -144,9 +144,30 @@ try {
     Assert-Equal $missingBuildPreflight.RecommendedMode 'dev' 'An unbuilt source checkout must recommend dev without silently switching modes.'
     Assert-True ($missingBuildPreflight.AvailableActions -contains 'build-with-confirmation') 'Missing build preflight must expose a separately confirmed build option.'
     Assert-True ($missingBuildPreflight.SecurityWarnings -contains 'default-initial-password') 'Preflight must report an unset/default initial password without exposing its value.'
+    Assert-Equal $missingBuildPreflight.SetupState 'unknown' 'An absent bootstrap marker must stay unknown, never be assumed configured.'
     $devPreflight = Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev
     Assert-Equal $devPreflight.Decision 'ready' 'Development mode must not require a production build.'
     Assert-Equal $devPreflight.RecommendedMode 'dev' 'Development mode must be the recommended unbuilt source mode.'
+
+    # Il marcatore di bootstrap e' cio' che separa "installato ma mai configurato" da
+    # "configurato e rotto": senza di esso il warning sulla password di default, da
+    # solo, non classifica nulla.
+    $sourceEnvPath = Join-Path $sourceRoot '.env'
+    $originalSourceEnv = if ([IO.File]::Exists($sourceEnvPath)) { [IO.File]::ReadAllText($sourceEnvPath) } else { $null }
+    try {
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=true`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'configured' 'An explicit true bootstrap marker must report the instance as configured.'
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=false`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'unconfigured' 'An explicit false bootstrap marker must report the instance as unconfigured.'
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=maybe`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'unknown' 'An unparsable bootstrap marker must fall back to unknown, not to configured.'
+        $preflightWithMarker = Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev
+        Assert-True ($preflightWithMarker.SecurityWarnings -contains 'default-initial-password') 'Reading the bootstrap marker must not lose the initial-password warning.'
+        $rawPreflight = $preflightWithMarker | ConvertTo-Json -Depth 6
+        Assert-True ($rawPreflight -notmatch 'CHANGEME') 'Preflight must never project the initial password value, only the warning.'
+    } finally {
+        if ($null -ne $originalSourceEnv) { [IO.File]::WriteAllText($sourceEnvPath, $originalSourceEnv) } else { [IO.File]::Delete($sourceEnvPath) }
+    }
     $runtimePreflightOutput = & pwsh -NoLogo -NoProfile -File $entryPoint preflight -Adapter source-checkout -Target $sourceRoot -Mode start -PreferencePath $preferencePath
     if ($LASTEXITCODE -ne 0) { throw 'Runtime preflight command failed.' }
     $runtimePreflight = $runtimePreflightOutput | ConvertFrom-Json -Depth 8
