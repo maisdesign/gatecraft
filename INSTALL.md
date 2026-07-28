@@ -53,3 +53,25 @@ session is running current instructions, especially right after cloning fresh or
 
 git, at least one CLI coding agent, a real shell. `bd` (beads) and the multi-profile tooling are
 NOT needed in advance: Step 0 detects them and asks permission before installing.
+
+## Optional OmniRoute gateway on a new machine
+
+Nothing about OmniRoute has to exist before installing this skill. On the first `/gatecraft`
+invocation Step 0.2 observes whether a gateway is present and, when it is not, offers a pinned
+official npm installation — only after showing the exact plan, and never from silence in unattended
+mode. Declining is a first-class answer: Gatecraft stays fully usable on direct CLI profiles.
+
+Installing is not the same as being usable. A fresh instance has no provider connected, so its
+catalog is empty and every route through it fails. Run
+
+```powershell
+pwsh -NoLogo -NoProfile -File <gatecraft-root>/scripts/omniroute-session.ps1 onboarding
+```
+
+and follow the ordered `next_actions` it projects — typically change the default password, open the
+local dashboard, connect at least one provider, create an API key, then retry readiness. Gatecraft
+reports those steps and stops there: connecting providers, completing consent screens, and handling
+API keys stay with you by design, and no key is ever written to the repository, a bead, or a
+receipt. See [gatecraft/references/omniroute.md](gatecraft/references/omniroute.md) for the full
+contract, including which providers are worth connecting (the dashboard's own list is the
+authority; the upstream free-tier documentation has been observed to disagree with it).

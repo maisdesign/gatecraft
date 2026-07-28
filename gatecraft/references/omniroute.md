@@ -75,6 +75,52 @@ Provider credentials therefore never enter a Gatecraft repository, a bead, a rec
 
 The supported onboarding is therefore: Gatecraft reaches a `ready` endpoint, tells the user the dashboard origin, and the user connects providers there themselves. OmniRoute ships a default `INITIAL_PASSWORD=CHANGEME`; surface that as the non-secret `default-initial-password` warning and have the user change it during that same attended pass. Afterwards Gatecraft re-reads `/v1/models` and reports the resulting worker pool as availability evidence — never as catalog authority, per the routing rules below.
 
+## Guided onboarding
+
+Installing and starting OmniRoute does not make it usable: a fresh instance has no provider
+connected, so `/v1/models` answers with an empty catalog and every route fails. The entry point's
+`onboarding` command turns that gap into an ordered, sanitized instruction list for the user
+instead of a readiness failure the operator has to interpret:
+
+```powershell
+pwsh -NoLogo -NoProfile -File <gatecraft-root>/scripts/omniroute-session.ps1 onboarding
+pwsh -NoLogo -NoProfile -File <gatecraft-root>/scripts/omniroute-session.ps1 onboarding -Target <omniroute-checkout>
+```
+
+It reuses `status`, adds source preflight evidence when a source checkout is known (an explicit
+`-Target`, otherwise the registered adapter), and projects one `stage` plus the ordered
+`next_actions` for that stage. It never connects a provider, opens a consent screen, changes a
+password, or reads a credential: `configuration_owner` is always `user`, and the projection carries
+no secret.
+
+| `stage` | Meaning | `next_actions` |
+| --- | --- | --- |
+| `not-installed` | No endpoint and no start adapter | `install-omniroute`, or `respect-never-install` when the preference says so |
+| `installed-not-running` | Discovered or registered but unreachable | `start-omniroute` |
+| `running-unconfigured` | Answers on a verified loopback listener with `catalog-empty` or `authentication-required` | `change-initial-password` (when warned), `open-dashboard`, `connect-provider`, `create-api-key`, `retry-readiness` |
+| `usable` | Ready with a non-empty catalog | `none` |
+| `broken` | Responding but the catalog is malformed | `inspect-endpoint` |
+
+`running-unconfigured` requires concordant evidence through `Test-GatecraftOmniRouteInstanceUnconfigured`:
+the default initial-password warning, a bootstrap state that is not `configured`, a verified
+loopback-only listener, and a responding-but-unusable catalog. Any single signal alone stays an
+ordinary failure, so a genuinely broken instance is never presented to the user as "just needs
+setup". `dashboard_url` is projected only for a loopback origin — a remote origin is never turned
+into a clickable link Gatecraft has not validated.
+
+`next_actions` name the steps; they are not authority to perform them. `none` is a sentinel and
+never coexists with a real action. Which providers to connect is the user's decision: prefer
+pointing them at the dashboard's own provider list over naming providers here, because that list
+changes and OmniRoute's own free-tier documentation has been observed to disagree with its
+provider registry.
+
+`adapter_authority` reports the stored startup adapter independently of the stage: `valid`, `stale`,
+or `none`. It matters because managed source startup runs `scripts/dev/run-next.mjs`, which
+regenerates tracked files under `.source/`; a `source-checkout` registration can therefore be
+invalidated by the very start it authorized, and the next session would otherwise find an
+unexplained loss of standing authority. When `stale`, `re-register-adapter` is added and the user
+must reconfirm path, mode, and current runner hash.
+
 ## Use decision
 
 When OmniRoute is present, or immediately after verified installation, offer these attended choices whenever the resolved policy is `ask`:

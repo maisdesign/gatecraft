@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install', 'install-health')]
+    [ValidateSet('status', 'onboarding', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'register-adapter', 'start', 'build-plan', 'build', 'install-plan', 'install', 'install-health')]
     [string] $Command,
 
     [string] $Endpoint,
@@ -40,7 +40,7 @@ try {
     $adapterArguments = @{}
     if (-not [string]::IsNullOrWhiteSpace($StartupAdapterPath)) { $adapterArguments.Path = $StartupAdapterPath }
     $preferences = Read-GatecraftOmniRoutePreferences @preferenceArguments
-    $invalidPreferenceFallbackCommands = @('status', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan', 'install-health')
+    $invalidPreferenceFallbackCommands = @('status', 'onboarding', 'get-preferences', 'set-preferences', 'get-project-policy', 'set-project-policy', 'resolve-policy', 'discover-adapters', 'discover-source', 'preflight', 'build-plan', 'install-plan', 'install-health')
     if (-not $preferences.Valid -and $Command -cnotin $invalidPreferenceFallbackCommands) { throw 'omniroute-preferences-invalid' }
     $effectiveEndpoint = if (-not [string]::IsNullOrWhiteSpace($Endpoint)) { $Endpoint } elseif ($preferences.Valid) { $preferences.Endpoint } else { 'http://localhost:20128' }
 
@@ -70,6 +70,56 @@ try {
             }
             if ($IncludeModelIds) { $projection.model_ids = @($status.Probe.ModelIds) }
             [pscustomobject]$projection
+        }
+        'onboarding' {
+            $statusArguments = @{ Endpoint = $effectiveEndpoint }
+            if (-not [string]::IsNullOrWhiteSpace($StartupAdapterPath)) { $statusArguments.StartupAdapterPath = $StartupAdapterPath }
+            $status = Get-GatecraftOmniRouteStatus @statusArguments
+
+            # Security warnings and bootstrap state exist only for a source checkout.
+            # Prefer an explicit -Target, else the registered adapter when it is one;
+            # otherwise the projection reports what it can and says nothing it cannot
+            # observe.
+            $onboardingWarnings = @()
+            $onboardingSetupState = 'unknown'
+            $preflightTarget = $Target
+            if ([string]::IsNullOrWhiteSpace($preflightTarget) -and
+                $status.StartupAdapter.Exists -and $status.StartupAdapter.Valid -and
+                $status.StartupAdapter.Record.type -ceq 'source-checkout') {
+                $preflightTarget = $status.StartupAdapter.Record.target
+            }
+            if (-not [string]::IsNullOrWhiteSpace($preflightTarget)) {
+                $preflightMode = if ($Mode -cin @('start', 'dev')) { $Mode } else { 'start' }
+                if (Test-GatecraftOmniRouteSourceCheckout -Path $preflightTarget -Mode $preflightMode) {
+                    $sourcePreflight = Get-GatecraftOmniRouteSourcePreflight -Target $preflightTarget -Mode $preflightMode
+                    $onboardingWarnings = @($sourcePreflight.SecurityWarnings)
+                    # SetupState is not part of the current preflight contract; read it
+                    # only when present so this stays correct if it is added later,
+                    # instead of throwing under Set-StrictMode.
+                    $setupStateProperty = $sourcePreflight.PSObject.Properties['SetupState']
+                    if ($null -ne $setupStateProperty -and $setupStateProperty.Value -cin @('configured', 'unconfigured', 'unknown')) {
+                        $onboardingSetupState = $setupStateProperty.Value
+                    }
+                }
+            }
+
+            $installPrompt = if ($preferences.Valid) { $preferences.InstallPrompt } else { 'ask' }
+            $onboarding = Get-GatecraftOmniRouteOnboarding -Status $status -SecurityWarnings $onboardingWarnings -SetupState $onboardingSetupState -InstallPrompt $installPrompt
+            [pscustomobject][ordered]@{
+                stage = $onboarding.Stage
+                state = $onboarding.State
+                endpoint_origin = $onboarding.Endpoint
+                reason_code = $onboarding.ReasonCode
+                model_count = $onboarding.ModelCount
+                dashboard_url = $onboarding.DashboardUrl
+                next_actions = @($onboarding.NextActions)
+                adapter_authority = $onboarding.AdapterAuthority
+                setup_state = $onboarding.SetupState
+                security_warnings = @($onboarding.SecurityWarnings)
+                configuration_owner = $onboarding.ConfigurationOwner
+                install_prompt = $installPrompt
+                preferences_valid = $preferences.Valid
+            }
         }
         'get-preferences' { $preferences }
         'set-preferences' {
