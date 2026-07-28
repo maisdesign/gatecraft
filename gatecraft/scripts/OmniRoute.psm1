@@ -850,6 +850,40 @@ function Test-GatecraftOmniRouteEndpoint {
         return New-GatecraftOmniRouteResult @{ ProbeState = 'invalid'; ReasonCode = 'endpoint-invalid'; ModelIds = @() }
     }
     $modelsUri = $Endpoint.TrimEnd('/') + '/v1/models'
+    # `localhost` resolves to ::1 first, but managed startup forces the IPv4-only
+    # HOST=127.0.0.1, so an IPv6 attempt fails with a transport error while the
+    # gateway is actually serving. Retry the literal IPv4 loopback before reporting
+    # `unreachable`; any non-transport outcome is authoritative and is never retried.
+    $candidateUris = [Collections.Generic.List[string]]::new()
+    $candidateUris.Add($modelsUri)
+    # Only the cast is guarded: an unparsable URI simply gets no retry. Keeping the
+    # Add() outside the catch means a fault there surfaces instead of silently
+    # degrading to a single attempt.
+    $modelsUriHost = $null
+    try { $modelsUriHost = ([uri] $modelsUri).Host } catch { $modelsUriHost = $null }
+    if ($modelsUriHost -ceq 'localhost') {
+        # Parentheses are required: a bare operator inside a method argument list is
+        # parsed as two arguments.
+        $candidateUris.Add(($modelsUri -creplace '(?<=://)localhost(?=[:/])', '127.0.0.1'))
+    }
+
+    $probeResult = $null
+    foreach ($candidateUri in $candidateUris) {
+        $probeResult = Invoke-GatecraftOmniRouteCatalogProbe -Uri $candidateUri -TimeoutSeconds $TimeoutSeconds -Request $Request
+        if ($probeResult.ProbeState -cne 'unreachable') { break }
+    }
+    return $probeResult
+}
+
+function Invoke-GatecraftOmniRouteCatalogProbe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Uri,
+        [ValidateRange(1, 30)][int] $TimeoutSeconds = 3,
+        [scriptblock] $Request
+    )
+
+    $modelsUri = $Uri
     try {
         if ($null -ne $Request) {
             $payload = & $Request $modelsUri $TimeoutSeconds
@@ -891,10 +925,16 @@ function Get-GatecraftOmniRouteStatus {
     param(
         [string] $Endpoint = $script:DefaultEndpoint,
         [ValidateRange(1, 30)][int] $TimeoutSeconds = 3,
-        [string] $StartupAdapterPath = (Get-GatecraftOmniRouteStartupAdapterPath)
+        [string] $StartupAdapterPath = (Get-GatecraftOmniRouteStartupAdapterPath),
+        # Test seam mirroring Test-GatecraftOmniRouteEndpoint: without it the
+        # probe-ready branch below can only be reached with a live gateway, so no
+        # machine-independent test could exercise it.
+        [scriptblock] $Request
     )
 
-    $probe = Test-GatecraftOmniRouteEndpoint -Endpoint $Endpoint -TimeoutSeconds $TimeoutSeconds
+    $probeArguments = @{ Endpoint = $Endpoint; TimeoutSeconds = $TimeoutSeconds }
+    if ($null -ne $Request) { $probeArguments.Request = $Request }
+    $probe = Test-GatecraftOmniRouteEndpoint @probeArguments
     $native = Get-GatecraftOmniRouteNativeCommand
     $docker = Get-Command docker -ErrorAction SilentlyContinue
     $containerPresent = $false

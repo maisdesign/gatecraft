@@ -292,6 +292,46 @@ server.listen(port, host);
     $unreachable = Test-GatecraftOmniRouteEndpoint -Request { param($Uri, $Timeout) throw [System.Net.Http.HttpRequestException]::new('offline') }
     Assert-Equal $unreachable.ProbeState 'unreachable' 'Transport failures must remain distinct from invalid catalogs.'
 
+    # Probe-ready branch of Get-GatecraftOmniRouteStatus. Without the -Request seam it
+    # is reachable only with a live gateway, so the empty-discovery projection could
+    # not be asserted deterministically on a machine that has no OmniRoute at all.
+    $readyStatus = Get-GatecraftOmniRouteStatus -Endpoint 'http://127.0.0.1:20128' -Request { param($Uri, $Timeout) [pscustomobject]@{ data = @([pscustomobject]@{ id = 'auto/cheap' }) } }
+    Assert-Equal $readyStatus.Probe.ProbeState 'ready' 'An injected ready catalog must make the status probe ready.'
+    Assert-Equal $readyStatus.DiscoveredAdapters.Count 0 'A ready gateway must skip discovery and still expose a countable collection.'
+    Assert-Equal @($readyStatus.DiscoveredAdapters | ForEach-Object { $_.Type } | Sort-Object -Unique).Count 0 'Projecting adapter types over the empty ready-path collection must not throw.'
+
+    # IPv6-first `localhost` resolution against the IPv4-only loopback bind that
+    # managed startup forces.
+    $loopbackAttempts = [Collections.Generic.List[string]]::new()
+    $loopbackRetry = Test-GatecraftOmniRouteEndpoint -Endpoint 'http://localhost:20128' -Request {
+        param($Uri, $Timeout)
+        $loopbackAttempts.Add($Uri)
+        if ($Uri -clike '*//localhost:*') { throw [System.Net.Http.HttpRequestException]::new('offline') }
+        [pscustomobject]@{ data = @([pscustomobject]@{ id = 'auto/cheap' }) }
+    }
+    Assert-Equal $loopbackRetry.ProbeState 'ready' 'An IPv4-only loopback bind must be reached after the localhost attempt fails.'
+    Assert-Equal $loopbackAttempts.Count 2 'A localhost transport failure must trigger exactly one IPv4 retry.'
+    Assert-Equal $loopbackAttempts[1] 'http://127.0.0.1:20128/v1/models' 'The retry must target the literal IPv4 loopback.'
+
+    $loopbackExhausted = Test-GatecraftOmniRouteEndpoint -Endpoint 'http://localhost:20128' -Request { param($Uri, $Timeout) throw [System.Net.Http.HttpRequestException]::new('offline') }
+    Assert-Equal $loopbackExhausted.ProbeState 'unreachable' 'Exhausting both loopback candidates must still report unreachable.'
+
+    $remoteAttempts = [Collections.Generic.List[string]]::new()
+    $null = Test-GatecraftOmniRouteEndpoint -Endpoint 'http://192.168.0.15:20128' -Request {
+        param($Uri, $Timeout)
+        $remoteAttempts.Add($Uri)
+        throw [System.Net.Http.HttpRequestException]::new('offline')
+    }
+    Assert-Equal $remoteAttempts.Count 1 'A non-localhost endpoint must never get a loopback retry.'
+
+    $invalidCatalogNotRetried = [Collections.Generic.List[string]]::new()
+    $null = Test-GatecraftOmniRouteEndpoint -Endpoint 'http://localhost:20128' -Request {
+        param($Uri, $Timeout)
+        $invalidCatalogNotRetried.Add($Uri)
+        [pscustomobject]@{ data = @() }
+    }
+    Assert-Equal $invalidCatalogNotRetried.Count 1 'A responding endpoint with an unusable catalog is authoritative and must not be retried.'
+
     $installPlan = New-GatecraftOmniRouteInstallPlan -Version '3.8.49'
     Assert-Equal $installPlan.DisplayCommand 'npm install --global omniroute@3.8.49 --include=optional' 'Install plan must pin and display the exact package version.'
     Assert-True ($installPlan.Source -ceq 'https://www.npmjs.com/package/omniroute') 'Install plan must name the official npm source.'
