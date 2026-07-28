@@ -31,3 +31,29 @@ The orchestrator chooses worker/reviewer settings, not the human's own orchestra
 For an active, available model with the requested supported thinking level, select the lowest `cost_tier` for `implementer` and ordinary `reviewer`; break ties by higher `quality_tier`, then ordinal model ID. `sensitive-reviewer` filters to `quality_tier=high` before applying the same tie-break. Construct the launch with explicit `--model <id>` and `--config model_reasoning_effort="<level>"`; accept it only when the launched session reports the same effective model and thinking level. A mismatch is `launch-setting-drift`, never an implicit retry with defaults.
 
 The human may opt in to a source, a refresh authority, or an explicit one-off fallback. Silence, stale data, network availability, or a provider error is never opt-in.
+
+## Populating the catalog from an OmniRoute gateway
+
+A ready gateway exposes its routes at `<endpoint>/v1/models`. Those IDs are availability evidence
+only: they carry no role, cost, quality, or sensitive-review eligibility, so the catalog cannot be
+generated from them mechanically. Deriving `cost_tier` or `quality_tier` from a model name would be
+fabrication — Gatecraft ships no auto-generator for this on purpose. Build the record by hand (or
+with a reviewed one-off script) and keep two rules:
+
+1. **Every catalogued ID must exist in the live catalog at build time.** Validate against
+   `/v1/models` while writing the record, so an absent route fails there instead of failing a
+   dispatch later.
+2. **`cost_tier` ranks scarcity, not price.** For free routes a defensible ranking is: unlimited and
+   account-free lowest, then a free tier on the user's own account, then an unofficial relay, then a
+   small monthly credit allowance highest. Selection prefers the lowest tier, so the ranking decides
+   which free lane absorbs ordinary work and which is held back.
+
+Keep `implementer` and `reviewer` on different models. Selection would otherwise route both roles to
+the same lowest-cost lane, and a review produced by the model that wrote the code shares its blind
+spots — the independence the reviewer role exists for is lost silently, with every gate still green.
+
+Gateway routes reach a Claude-Code-shaped worker through the `anthropic` adapter
+(`--model <id> --effort <level>`) and a Codex-shaped worker through the `openai` adapter. Verify the
+installed CLI actually accepts those flags for the version in use before accepting a launch manifest;
+`Get-GatecraftProviderLaunchArguments` returns `$null` for any other provider, which blocks the
+dispatch as `unsupported-provider-adapter` rather than guessing.
