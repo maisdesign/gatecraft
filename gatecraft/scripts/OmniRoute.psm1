@@ -894,13 +894,43 @@ function Invoke-GatecraftOmniRouteCatalogProbe {
         if ($payload -is [string]) { $payload = $payload | ConvertFrom-Json -Depth 20 -ErrorAction Stop }
         if ($null -eq $payload -or $null -eq $payload.data) { throw 'catalog-shape' }
         $ids = @($payload.data | ForEach-Object { if ($_.id -is [string] -and -not [string]::IsNullOrWhiteSpace($_.id)) { $_.id } })
-        if ($ids.Count -eq 0 -or $ids.Count -ne @($ids | Sort-Object -Unique).Count) { throw 'catalog-models' }
-        return New-GatecraftOmniRouteResult @{ ProbeState = 'ready'; ReasonCode = 'catalog-valid'; ModelIds = @($ids) }
+        # An endpoint that answers with zero models is a freshly installed instance
+        # with no provider connected, not a broken one. Keeping it distinct from
+        # `catalog-invalid` is what lets onboarding guide the user instead of
+        # reporting a misleading readiness failure.
+        if ($ids.Count -eq 0) {
+            return New-GatecraftOmniRouteResult @{ ProbeState = 'invalid'; ReasonCode = 'catalog-empty'; ModelIds = @(); HttpStatus = 200 }
+        }
+        if ($ids.Count -ne @($ids | Sort-Object -Unique).Count) { throw 'catalog-models' }
+        return New-GatecraftOmniRouteResult @{ ProbeState = 'ready'; ReasonCode = 'catalog-valid'; ModelIds = @($ids); HttpStatus = 200 }
     } catch [System.Net.Http.HttpRequestException], [System.Net.WebException], [System.Threading.Tasks.TaskCanceledException] {
-        return New-GatecraftOmniRouteResult @{ ProbeState = 'unreachable'; ReasonCode = 'endpoint-unreachable'; ModelIds = @() }
+        # A responding endpoint that rejects the caller is also not a transport
+        # failure: it means the instance is up but this caller has no usable key.
+        $status = Get-GatecraftOmniRouteResponseStatus -ErrorRecord $_
+        if ($status -in @(401, 403)) {
+            return New-GatecraftOmniRouteResult @{ ProbeState = 'invalid'; ReasonCode = 'authentication-required'; ModelIds = @(); HttpStatus = $status }
+        }
+        return New-GatecraftOmniRouteResult @{ ProbeState = 'unreachable'; ReasonCode = 'endpoint-unreachable'; ModelIds = @(); HttpStatus = $status }
     } catch {
-        return New-GatecraftOmniRouteResult @{ ProbeState = 'invalid'; ReasonCode = 'catalog-invalid'; ModelIds = @() }
+        return New-GatecraftOmniRouteResult @{ ProbeState = 'invalid'; ReasonCode = 'catalog-invalid'; ModelIds = @(); HttpStatus = $null }
     }
+}
+
+function Get-GatecraftOmniRouteResponseStatus {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $ErrorRecord)
+
+    foreach ($candidate in @($ErrorRecord.Exception, $ErrorRecord.Exception.InnerException)) {
+        if ($null -eq $candidate) { continue }
+        $directStatus = $candidate.PSObject.Properties['StatusCode']
+        if ($null -ne $directStatus -and $null -ne $directStatus.Value) { return [int] $directStatus.Value }
+        $response = $candidate.PSObject.Properties['Response']
+        if ($null -ne $response -and $null -ne $response.Value) {
+            $responseStatus = $response.Value.PSObject.Properties['StatusCode']
+            if ($null -ne $responseStatus -and $null -ne $responseStatus.Value) { return [int] $responseStatus.Value }
+        }
+    }
+    return $null
 }
 
 function Resolve-GatecraftOmniRouteObservedState {
@@ -918,6 +948,135 @@ function Resolve-GatecraftOmniRouteObservedState {
     if ($ProbeState -ceq 'invalid' -or ($DockerContainerRunning -and $ProbeState -ceq 'unreachable')) { return 'broken' }
     if ($NativeCommandPresent -or $DockerContainerPresent -or $RegisteredAdapterPresent -or $DiscoveredAdapterPresent) { return 'installed-stopped' }
     return 'missing'
+}
+
+function Test-GatecraftOmniRouteInstanceUnconfigured {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][string[]] $SecurityWarnings = @(),
+        [Parameter(Mandatory)][ValidateSet('configured', 'unconfigured', 'unknown')][string] $SetupState,
+        [Parameter(Mandatory)] $Probe,
+        [Parameter(Mandatory)] $Listener
+    )
+
+    # Concordant evidence only: a responding-but-unusable endpoint on a verified
+    # loopback listener, on a checkout that still reports the default initial
+    # password and no completed bootstrap. Any single signal on its own stays an
+    # ordinary readiness failure, so a genuinely broken instance is never sold to
+    # the user as "just needs setup".
+    $respondingButUnusable = $Probe.ProbeState -ceq 'invalid' -and
+        $Probe.ReasonCode -cin @('catalog-empty', 'authentication-required')
+    return $SecurityWarnings -contains 'default-initial-password' -and
+        $SetupState -cne 'configured' -and
+        $Listener.Verified -and
+        $Listener.Safe -and
+        $respondingButUnusable
+}
+
+function Get-GatecraftOmniRouteDashboardUrl {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Endpoint)
+
+    # Only a loopback origin may be projected as a clickable dashboard: a remote
+    # origin could carry the user somewhere Gatecraft never validated.
+    try { $parsed = [uri] $Endpoint } catch { return $null }
+    if ($parsed.Host -cnotin @('localhost', '127.0.0.1', '::1', '[::1]')) { return $null }
+    return $Endpoint.TrimEnd('/') + '/dashboard'
+}
+
+function Get-GatecraftOmniRouteOnboarding {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Status,
+        [AllowEmptyCollection()][string[]] $SecurityWarnings = @(),
+        [ValidateSet('configured', 'unconfigured', 'unknown')][string] $SetupState = 'unknown',
+        [ValidateSet('ask', 'never')][string] $InstallPrompt = 'ask'
+    )
+
+    $endpoint = $Status.Endpoint
+    $reason = $Status.Probe.ReasonCode
+    $modelCount = @($Status.Probe.ModelIds).Count
+    $dashboardUrl = Get-GatecraftOmniRouteDashboardUrl -Endpoint $endpoint
+    $actions = [Collections.Generic.List[string]]::new()
+
+    switch ($Status.State) {
+        'missing' {
+            $stage = 'not-installed'
+            if ($InstallPrompt -ceq 'never') { $actions.Add('respect-never-install') } else { $actions.Add('install-omniroute') }
+        }
+        'installed-stopped' {
+            $stage = 'installed-not-running'
+            $actions.Add('start-omniroute')
+        }
+        'ready' {
+            if ($modelCount -gt 0) {
+                $stage = 'usable'
+                $actions.Add('none')
+            } else {
+                # Defensive: 'ready' is defined as a non-empty catalog, so this is a
+                # contract violation rather than an expected state. Report it instead
+                # of projecting a usable gateway.
+                $stage = 'inconsistent'
+                $actions.Add('report-contract-violation')
+            }
+        }
+        'broken' {
+            if ($reason -cin @('catalog-empty', 'authentication-required')) {
+                # Up and answering, but nothing usable behind it: this is the fresh
+                # install that needs an attended setup pass, not a fault to repair.
+                $stage = 'running-unconfigured'
+                if ($SecurityWarnings -contains 'default-initial-password') { $actions.Add('change-initial-password') }
+                $actions.Add('open-dashboard')
+                $actions.Add('connect-provider')
+                $actions.Add('create-api-key')
+                $actions.Add('retry-readiness')
+            } else {
+                $stage = 'broken'
+                $actions.Add('inspect-endpoint')
+            }
+        }
+        default {
+            $stage = 'unknown'
+            $actions.Add('inspect-endpoint')
+        }
+    }
+
+    # Orthogonal to the stage: a stored startup adapter whose identity no longer
+    # matches has silently lost its standing authority. Managed source startup runs
+    # `scripts/dev/run-next.mjs`, which regenerates tracked files under `.source/`,
+    # so a source-checkout registration can be invalidated by the very start it
+    # authorized. Say so instead of letting the next session look unexplained.
+    $adapterRecord = $Status.PSObject.Properties['StartupAdapter']
+    $adapterAuthority = 'none'
+    if ($null -ne $adapterRecord -and $null -ne $adapterRecord.Value) {
+        if ($adapterRecord.Value.Exists -and $adapterRecord.Value.Valid) {
+            $adapterAuthority = 'valid'
+        } elseif ($adapterRecord.Value.Exists) {
+            $adapterAuthority = 'stale'
+            $actions.Add('re-register-adapter')
+        }
+    }
+
+    # `none` is a sentinel meaning "nothing to do": it must never coexist with a
+    # real action, or a caller reading the first element would report the opposite
+    # of the truth.
+    if ($actions.Count -gt 1 -and $actions.Contains('none')) { $actions.Remove('none') | Out-Null }
+
+    return New-GatecraftOmniRouteResult @{
+        Stage = $stage
+        State = $Status.State
+        Endpoint = $endpoint
+        ReasonCode = $reason
+        ModelCount = $modelCount
+        DashboardUrl = $dashboardUrl
+        NextActions = @($actions)
+        AdapterAuthority = $adapterAuthority
+        SetupState = $SetupState
+        SecurityWarnings = @($SecurityWarnings)
+        # Configuration is the user's: Gatecraft never connects a provider, changes
+        # a password, or reads a credential. It reports what is missing and stops.
+        ConfigurationOwner = 'user'
+    }
 }
 
 function Get-GatecraftOmniRouteStatus {
@@ -1361,6 +1520,9 @@ Export-ModuleMember -Function @(
     'Invoke-GatecraftOmniRoutePostinstall',
     'Test-GatecraftOmniRouteInstallHealth',
     'Get-GatecraftOmniRouteStatus',
+    'Test-GatecraftOmniRouteInstanceUnconfigured',
+    'Get-GatecraftOmniRouteDashboardUrl',
+    'Get-GatecraftOmniRouteOnboarding',
     'Start-GatecraftOmniRoute',
     'Test-GatecraftOmniRouteLoopbackListener',
     'New-GatecraftOmniRouteSourceBuildPlan',

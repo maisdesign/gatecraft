@@ -332,6 +332,66 @@ server.listen(port, host);
     }
     Assert-Equal $invalidCatalogNotRetried.Count 1 'A responding endpoint with an unusable catalog is authoritative and must not be retried.'
 
+    # An instance that answers but has nothing usable behind it is a setup gap, not a
+    # fault. Keeping these reason codes distinct is what onboarding classifies on.
+    $emptyCatalog = Test-GatecraftOmniRouteEndpoint -Request { param($Uri, $Timeout) [pscustomobject]@{ data = @() } }
+    Assert-Equal $emptyCatalog.ProbeState 'invalid' 'An empty catalog must not be reported as ready.'
+    Assert-Equal $emptyCatalog.ReasonCode 'catalog-empty' 'An empty catalog must stay distinct from a malformed one.'
+    $unauthorized = Test-GatecraftOmniRouteEndpoint -Request { param($Uri, $Timeout) throw [System.Net.Http.HttpRequestException]::new('denied', $null, [System.Net.HttpStatusCode]::Unauthorized) }
+    Assert-Equal $unauthorized.ReasonCode 'authentication-required' 'HTTP 401 must be distinct from a transport failure.'
+    Assert-Equal $unauthorized.HttpStatus 401 'The observed HTTP status must be projected for authentication failures.'
+    $malformedCatalog = Test-GatecraftOmniRouteEndpoint -Request { param($Uri, $Timeout) [pscustomobject]@{ nothing = $true } }
+    Assert-Equal $malformedCatalog.ReasonCode 'catalog-invalid' 'A shape violation must remain catalog-invalid.'
+
+    Assert-Equal (Get-GatecraftOmniRouteDashboardUrl -Endpoint 'http://localhost:20128') 'http://localhost:20128/dashboard' 'A loopback endpoint must project a dashboard URL.'
+    Assert-Equal (Get-GatecraftOmniRouteDashboardUrl -Endpoint 'http://192.168.0.15:20128') $null 'A non-loopback endpoint must never be projected as a clickable dashboard.'
+
+    $safeListener = [pscustomobject]@{ Verified = $true; Safe = $true }
+    $unsafeListener = [pscustomobject]@{ Verified = $true; Safe = $false }
+    Assert-True (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @('default-initial-password') -SetupState unknown -Probe $emptyCatalog -Listener $safeListener) 'Concordant evidence must classify an instance as merely unconfigured.'
+    Assert-True (-not (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @() -SetupState unknown -Probe $emptyCatalog -Listener $safeListener)) 'Without the default-password signal an empty catalog stays an ordinary failure.'
+    Assert-True (-not (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @('default-initial-password') -SetupState configured -Probe $emptyCatalog -Listener $safeListener)) 'A checkout marked configured must keep ordinary readiness semantics.'
+    Assert-True (-not (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @('default-initial-password') -SetupState unknown -Probe $emptyCatalog -Listener $unsafeListener)) 'An unsafe listener must never be offered for attended setup.'
+    Assert-True (-not (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @('default-initial-password') -SetupState unknown -Probe $malformedCatalog -Listener $safeListener)) 'A malformed catalog is a fault, not a setup gap.'
+
+    function New-OnboardingStatusFixture([string] $State, [string] $Reason, [string[]] $Ids, [bool] $AdapterExists, [bool] $AdapterValid) {
+        [pscustomobject]@{
+            State = $State
+            Endpoint = 'http://localhost:20128'
+            Probe = [pscustomobject]@{ ProbeState = 'invalid'; ReasonCode = $Reason; ModelIds = @($Ids) }
+            StartupAdapter = [pscustomobject]@{ Exists = $AdapterExists; Valid = $AdapterValid }
+        }
+    }
+
+    $missingOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'missing' 'endpoint-unreachable' @() $false $false)
+    Assert-Equal $missingOnboarding.Stage 'not-installed' 'A missing gateway must be projected as not installed.'
+    Assert-True ($missingOnboarding.NextActions -contains 'install-omniroute') 'A missing gateway must offer installation.'
+    $neverInstall = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'missing' 'endpoint-unreachable' @() $false $false) -InstallPrompt never
+    Assert-True ($neverInstall.NextActions -contains 'respect-never-install') 'A never-install preference must not be overridden by onboarding.'
+
+    $stoppedOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'installed-stopped' 'endpoint-unreachable' @() $true $true)
+    Assert-Equal $stoppedOnboarding.Stage 'installed-not-running' 'A stopped installation must be projected as not running.'
+    Assert-Equal $stoppedOnboarding.AdapterAuthority 'valid' 'A matching startup adapter must project standing authority.'
+
+    $unconfiguredOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'broken' 'catalog-empty' @() $false $false) -SecurityWarnings @('default-initial-password')
+    Assert-Equal $unconfiguredOnboarding.Stage 'running-unconfigured' 'A responding empty instance must be projected as needing attended setup, not as broken.'
+    Assert-True ($unconfiguredOnboarding.NextActions -contains 'connect-provider' -and $unconfiguredOnboarding.NextActions -contains 'create-api-key') 'Unconfigured onboarding must name the provider and key steps.'
+    Assert-True ($unconfiguredOnboarding.NextActions -contains 'change-initial-password') 'A default initial password must be surfaced as an action.'
+    Assert-Equal $unconfiguredOnboarding.ConfigurationOwner 'user' 'Onboarding must record that configuration stays the user'"'"'s.'
+
+    $brokenOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'broken' 'catalog-invalid' @() $false $false) -SecurityWarnings @('default-initial-password')
+    Assert-Equal $brokenOnboarding.Stage 'broken' 'A malformed catalog must stay broken even with a default password warning.'
+
+    $usableOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'ready' 'catalog-valid' @('auto/cheap') $false $false)
+    Assert-Equal $usableOnboarding.Stage 'usable' 'A ready gateway with models must be projected as usable.'
+    Assert-Equal @($usableOnboarding.NextActions).Count 1 'A usable gateway must project exactly the none sentinel.'
+    Assert-Equal $usableOnboarding.NextActions[0] 'none' 'A usable gateway must project the none sentinel.'
+
+    $staleAdapterOnboarding = Get-GatecraftOmniRouteOnboarding -Status (New-OnboardingStatusFixture 'ready' 'catalog-valid' @('auto/cheap') $true $false)
+    Assert-Equal $staleAdapterOnboarding.AdapterAuthority 'stale' 'A stored adapter whose identity drifted must be reported as stale.'
+    Assert-True ($staleAdapterOnboarding.NextActions -contains 're-register-adapter') 'A stale adapter must ask for re-registration.'
+    Assert-True (-not ($staleAdapterOnboarding.NextActions -contains 'none')) 'The none sentinel must never coexist with a real action.'
+
     $installPlan = New-GatecraftOmniRouteInstallPlan -Version '3.8.49'
     Assert-Equal $installPlan.DisplayCommand 'npm install --global omniroute@3.8.49 --include=optional' 'Install plan must pin and display the exact package version.'
     Assert-True ($installPlan.Source -ceq 'https://www.npmjs.com/package/omniroute') 'Install plan must name the official npm source.'
@@ -385,4 +445,4 @@ server.listen(port, host);
     }
 }
 
-Write-Host 'OmniRoute gate passed: preferences, precedence, discovery states, typed startup registry, endpoint validation, project scope, and pinned consent.'
+Write-Host 'OmniRoute gate passed: preferences, precedence, discovery states, typed startup registry, endpoint validation, project scope, pinned consent, loopback retry, and guided onboarding stages.'
