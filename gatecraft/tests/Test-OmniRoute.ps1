@@ -385,6 +385,26 @@ server.listen(port, host);
     Assert-Equal (Invoke-LaneProbeFixture 408).Verdict 'transient' 'A request timeout must stay retryable.'
     Assert-Equal (Invoke-LaneProbeFixture 401).ReasonCode 'probe-unauthorized' 'A rejected credential must not be attributed to the model.'
     Assert-Equal (Invoke-LaneProbeFixture 401).Verdict 'blocked' 'A credential problem must block rather than judge the lane.'
+    # OmniRoute scarta una richiesta che ha atteso oltre il budget della sua coda
+    # locale e lo riporta come 502, che sembra un guasto dell'upstream. Il default e'
+    # 15s, stretto per un free tier dove una richiesta a dimensione di worker ci mette
+    # regolarmente di piu': la corsia sembra rotta quando e' rotto solo quel budget.
+    $laneQueueBudget = Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request {
+        param($Uri, $Body, $Timeout)
+        throw [System.Net.Http.HttpRequestException]::new(
+            'Request dropped after exceeding the local rate-limit queue budget maxWaitMs (15000ms) for probe/model',
+            $null,
+            [System.Net.HttpStatusCode]::BadGateway)
+    }
+    Assert-Equal $laneQueueBudget.ReasonCode 'lane-queue-budget' "OmniRoute's own queue rejection must be named, not reported as an upstream fault."
+    Assert-Equal $laneQueueBudget.Verdict 'transient' 'A queue budget rejection says nothing permanent about the lane.'
+    Assert-Equal $laneQueueBudget.HttpStatus 502 'The observed status must still be projected for the queue rejection.'
+    $laneGenericGateway = Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request {
+        param($Uri, $Body, $Timeout)
+        throw [System.Net.Http.HttpRequestException]::new('upstream provider unavailable', $null, [System.Net.HttpStatusCode]::BadGateway)
+    }
+    Assert-Equal $laneGenericGateway.ReasonCode 'lane-indeterminate' 'A 502 without the queue signature must stay a generic indeterminate result.'
+
     $laneTransport = Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request { param($Uri, $Body, $Timeout) throw [System.Net.Http.HttpRequestException]::new('offline') }
     Assert-Equal $laneTransport.Verdict 'transient' 'A transport failure must never be a permanent verdict.'
     Assert-Equal $laneTransport.ReasonCode 'lane-unreachable' 'A transport failure must have its own reason code.'
