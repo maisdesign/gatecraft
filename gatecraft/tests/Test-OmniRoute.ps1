@@ -144,9 +144,30 @@ try {
     Assert-Equal $missingBuildPreflight.RecommendedMode 'dev' 'An unbuilt source checkout must recommend dev without silently switching modes.'
     Assert-True ($missingBuildPreflight.AvailableActions -contains 'build-with-confirmation') 'Missing build preflight must expose a separately confirmed build option.'
     Assert-True ($missingBuildPreflight.SecurityWarnings -contains 'default-initial-password') 'Preflight must report an unset/default initial password without exposing its value.'
+    Assert-Equal $missingBuildPreflight.SetupState 'unknown' 'An absent bootstrap marker must stay unknown, never be assumed configured.'
     $devPreflight = Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev
     Assert-Equal $devPreflight.Decision 'ready' 'Development mode must not require a production build.'
     Assert-Equal $devPreflight.RecommendedMode 'dev' 'Development mode must be the recommended unbuilt source mode.'
+
+    # Il marcatore di bootstrap e' cio' che separa "installato ma mai configurato" da
+    # "configurato e rotto": senza di esso il warning sulla password di default, da
+    # solo, non classifica nulla.
+    $sourceEnvPath = Join-Path $sourceRoot '.env'
+    $originalSourceEnv = if ([IO.File]::Exists($sourceEnvPath)) { [IO.File]::ReadAllText($sourceEnvPath) } else { $null }
+    try {
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=true`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'configured' 'An explicit true bootstrap marker must report the instance as configured.'
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=false`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'unconfigured' 'An explicit false bootstrap marker must report the instance as unconfigured.'
+        [IO.File]::WriteAllText($sourceEnvPath, "INITIAL_PASSWORD=CHANGEME`nOMNIROUTE_BOOTSTRAPPED=maybe`n")
+        Assert-Equal (Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev).SetupState 'unknown' 'An unparsable bootstrap marker must fall back to unknown, not to configured.'
+        $preflightWithMarker = Get-GatecraftOmniRouteSourcePreflight -Target $sourceRoot -Mode dev
+        Assert-True ($preflightWithMarker.SecurityWarnings -contains 'default-initial-password') 'Reading the bootstrap marker must not lose the initial-password warning.'
+        $rawPreflight = $preflightWithMarker | ConvertTo-Json -Depth 6
+        Assert-True ($rawPreflight -notmatch 'CHANGEME') 'Preflight must never project the initial password value, only the warning.'
+    } finally {
+        if ($null -ne $originalSourceEnv) { [IO.File]::WriteAllText($sourceEnvPath, $originalSourceEnv) } else { [IO.File]::Delete($sourceEnvPath) }
+    }
     $runtimePreflightOutput = & pwsh -NoLogo -NoProfile -File $entryPoint preflight -Adapter source-checkout -Target $sourceRoot -Mode start -PreferencePath $preferencePath
     if ($LASTEXITCODE -ne 0) { throw 'Runtime preflight command failed.' }
     $runtimePreflight = $runtimePreflightOutput | ConvertFrom-Json -Depth 8
@@ -428,12 +449,38 @@ server.listen(port, host);
     $entryPointPath = (Resolve-Path (Join-Path $PSScriptRoot '../scripts/omniroute-session.ps1')).Path
     $escapedEntryPoint = $entryPointPath.Replace("'", "''")
     $escapedPwsh = (Get-Command pwsh).Source.Replace("'", "''")
+
+    # Fonte canonica dei tipi di adapter: la ValidateSet del parametro -Adapter
+    # nell'entry point. Derivarla, invece di ricopiarla in ogni asserzione, e' cio'
+    # che impedisce alle tre liste (entry point, modulo, test) di divergere senza che
+    # nessun gate se ne accorga.
+    $entryPointSource = [IO.File]::ReadAllText($entryPointPath)
+    $adapterDeclaration = @($entryPointSource -split '\r?\n' | Where-Object { $_ -match '\$Adapter\b' -and $_ -match 'ValidateSet' })
+    Assert-Equal $adapterDeclaration.Count 1 'The entry point must declare exactly one ValidateSet for the -Adapter parameter.'
+    $canonicalAdapterTypes = @([regex]::Matches($adapterDeclaration[0], "'(?<token>[a-z][a-z-]*)'") | ForEach-Object { $_.Groups['token'].Value })
+    Assert-True ($canonicalAdapterTypes.Count -ge 5) 'The canonical adapter type list must cover every supported startup adapter.'
+
+    # Guardia contro il drift: ogni Type che il modulo puo' emettere deve essere fra i
+    # canonici. Aggiungere un adapter da un lato solo ora fallisce il gate invece di
+    # restare latente fino alla macchina che usa proprio quell'adapter.
+    $moduleSource = [IO.File]::ReadAllText($module)
+    $emittedAdapterTypes = @([regex]::Matches($moduleSource, "Type = '(?<token>[a-z][a-z-]*)'") | ForEach-Object { $_.Groups['token'].Value } | Sort-Object -Unique)
+    Assert-True ($emittedAdapterTypes.Count -gt 0 -and $emittedAdapterTypes.Count -le $canonicalAdapterTypes.Count) 'The module must emit at least one adapter type and never more kinds than the entry point accepts.'
+    $undeclaredAdapterTypes = @($emittedAdapterTypes | Where-Object { $_ -cnotin $canonicalAdapterTypes })
+    Assert-Equal $undeclaredAdapterTypes.Count 0 "Every adapter type the module emits must appear in the entry point ValidateSet. Undeclared: $($undeclaredAdapterTypes -join ', ')"
     $statusProbe = & $moduleInfo ([scriptblock]::Create("Invoke-GatecraftOmniRouteProcess -FilePath '$escapedPwsh' -Arguments @('-NoLogo', '-NoProfile', '-File', '$escapedEntryPoint', 'status') -TimeoutMilliseconds 30000"))
     Assert-True (-not $statusProbe.TimedOut) 'GC-0.2 status discovery must complete within its bound.'
     Assert-Equal $statusProbe.ExitCode 0 'GC-0.2 status must project an observed state even when discovery returns no startup adapter.'
     $statusProjection = $statusProbe.Stdout | ConvertFrom-Json
     Assert-True ($statusProjection.state -cin @('missing', 'installed-stopped', 'ready', 'broken')) 'Status must project one of the four observed states, never an empty state.'
-    Assert-True ($statusProjection.adapter -cin @('none', 'native-cli', 'docker-existing', 'source-checkout', 'desktop-application', 'user-systemd-service')) 'Status must project a resolved adapter token, never an empty adapter.'
+    # I token accettati non sono piu' una lista scritta a mano: veniva da un'altra
+    # convenzione di naming ('desktop-application', 'user-systemd-service') e nessuno
+    # dei due esiste nel modulo, che emette 'desktop-app' e 'systemd-user'. La lista
+    # sbagliata non poteva fallire su questa macchina, dove l'adapter risolto e'
+    # 'source-checkout', ma sarebbe fallita su Linux con un servizio systemd
+    # registrato. Ora la fonte e' la ValidateSet dell'entry point, che e' la
+    # dichiarazione canonica, piu' il sentinella 'none'.
+    Assert-True ($statusProjection.adapter -cin (@('none') + $canonicalAdapterTypes)) 'Status must project a resolved adapter token, never an empty adapter.'
     Assert-True ($statusProjection.discovered_adapter_types -is [array]) 'Discovered adapter types must project as an array even when discovery is empty.'
     Assert-True ($statusProjection.discovered_adapter_count -ge 0) 'Discovered adapter count must project as a number even when discovery is empty.'
 } finally {

@@ -121,6 +121,40 @@ invalidated by the very start it authorized, and the next session would otherwis
 unexplained loss of standing authority. When `stale`, `re-register-adapter` is added and the user
 must reconfirm path, mode, and current runner hash.
 
+### Readiness that stops at a setup gap
+
+A freshly installed instance listens and answers, but has no provider connected, so
+`/v1/models` stays empty and readiness never arrives. Left alone, the bounded wait expires and
+reports a generic `readiness-timeout` — an operator then has to guess whether the gateway is
+broken or merely unconfigured. Managed source startup therefore classifies that case explicitly.
+
+`Get-GatecraftOmniRouteSourcePreflight` reads `OMNIROUTE_BOOTSTRAPPED` alongside
+`INITIAL_PASSWORD` and projects `SetupState` as `configured`, `unconfigured`, or `unknown`. Only an
+explicit `true` counts as configured: an absent or unparsable marker stays `unknown` and never
+authorises treating an instance as already set up. The marker's value is read but never projected,
+exactly like the password.
+
+While waiting for readiness, a managed `source-checkout` launch returns `State=needs-action` with
+`ReasonCode=instance-unconfigured` when `Test-GatecraftOmniRouteInstanceUnconfigured` agrees on all
+of its signals: the default initial-password warning, a `SetupState` that is not `configured`, a
+verified loopback-only listener, and a probe that responded with `catalog-empty` or
+`authentication-required`. Any single signal alone stays an ordinary readiness failure, so a
+genuinely broken instance is never presented as "just needs setup". A verified non-loopback listener
+still fails closed and reaps the tree before any of this is considered.
+
+The `needs-action` result carries the local `DashboardUrl` (loopback origins only),
+`RequiredActions` = `login`, `change-initial-password`, `configure-provider`, `retry-readiness`,
+`AvailableActions` = `open-dashboard`, `use-direct-profiles`, `stop-omniroute`, the PID and start
+identity, and `KeptRunningForSetup=true`. The already-authorised loopback process stays alive for
+the attended setup pass and must remain in the session's process/reap manifest. Gatecraft must not
+open the dashboard, change the password, add a provider, read a credential, or treat this state as
+ready: it names the steps and stops. Continue orchestration on direct profiles until the human pass
+is done.
+
+A genuine `readiness-timeout` now also projects `ProbeReasonCode`, `SecurityWarnings`, and
+`SetupState`, so the failure says whether nothing answered or something answered unusably — two
+different problems that were previously the same message.
+
 ## Use decision
 
 When OmniRoute is present, or immediately after verified installation, offer these attended choices whenever the resolved policy is `ask`:

@@ -394,20 +394,34 @@ function Get-GatecraftOmniRouteSourcePreflight {
     )
 
     if (-not (Test-GatecraftOmniRouteSourceCheckout -Path $Target -Mode $Mode)) {
-        return New-GatecraftOmniRouteResult @{ Decision = 'block'; ReasonCode = 'source-checkout-invalid'; RecommendedMode = $null; AvailableActions = @('use-direct-profiles'); BuildReady = $false; SecurityWarnings = @() }
+        return New-GatecraftOmniRouteResult @{ Decision = 'block'; ReasonCode = 'source-checkout-invalid'; RecommendedMode = $null; AvailableActions = @('use-direct-profiles'); BuildReady = $false; SecurityWarnings = @(); SetupState = 'unknown' }
     }
     $root = [IO.Path]::GetFullPath($Target)
     $initialPassword = $env:INITIAL_PASSWORD
-    if ([string]::IsNullOrWhiteSpace($initialPassword)) {
+    # OMNIROUTE_BOOTSTRAPPED e' l'unico marcatore che dice se l'istanza ha completato
+    # la configurazione iniziale. Serve a distinguere "installato ma mai configurato"
+    # da "configurato e rotto": senza di esso il warning sulla password di default,
+    # da solo, non basta a classificare nulla.
+    $bootstrapped = $env:OMNIROUTE_BOOTSTRAPPED
+    if ([string]::IsNullOrWhiteSpace($initialPassword) -or [string]::IsNullOrWhiteSpace($bootstrapped)) {
         $envPath = Join-Path $root '.env'
         if ([IO.File]::Exists($envPath)) {
             try {
-                $passwordLine = [IO.File]::ReadLines($envPath) | Where-Object { $_ -cmatch '^\s*INITIAL_PASSWORD\s*=' } | Select-Object -First 1
-                if ($null -ne $passwordLine) { $initialPassword = ($passwordLine -split '=', 2)[1].Trim().Trim('"', "'") }
-            } catch { $initialPassword = $null }
+                # ReadAllLines, non ReadLines: quest'ultima e' lazy, e uscire
+                # dall'enumerazione con un break lascia lo StreamReader non disposto,
+                # tenendo il file bloccato fino alla garbage collection. Un .env e'
+                # piccolo, quindi leggerlo tutto non costa nulla e non lascia handle.
+                foreach ($line in [IO.File]::ReadAllLines($envPath)) {
+                    if ([string]::IsNullOrWhiteSpace($initialPassword) -and $line -cmatch '^\s*INITIAL_PASSWORD\s*=') { $initialPassword = ($line -split '=', 2)[1].Trim().Trim('"', "'") }
+                    if ([string]::IsNullOrWhiteSpace($bootstrapped) -and $line -cmatch '^\s*OMNIROUTE_BOOTSTRAPPED\s*=') { $bootstrapped = ($line -split '=', 2)[1].Trim().Trim('"', "'") }
+                }
+            } catch { $initialPassword = $null; $bootstrapped = $null }
         }
     }
     $securityWarnings = if ([string]::IsNullOrWhiteSpace($initialPassword) -or $initialPassword -ceq 'CHANGEME') { @('default-initial-password') } else { @() }
+    # Solo un 'true' esplicito conta come configurato: l'assenza del marcatore resta
+    # 'unknown' e non autorizza a dare per configurata un'istanza.
+    $setupState = if ($bootstrapped -ceq 'true') { 'configured' } elseif ($bootstrapped -ceq 'false') { 'unconfigured' } else { 'unknown' }
     $buildMarker = Join-Path $root '.build/next/BUILD_ID'
     $buildReady = $false
     if ([IO.File]::Exists($buildMarker)) {
@@ -421,6 +435,7 @@ function Get-GatecraftOmniRouteSourcePreflight {
             AvailableActions = @('use-dev', 'build-with-confirmation', 'use-direct-profiles')
             BuildReady = $false
             SecurityWarnings = $securityWarnings
+            SetupState = $setupState
         }
     }
     return New-GatecraftOmniRouteResult @{
@@ -430,6 +445,7 @@ function Get-GatecraftOmniRouteSourcePreflight {
         AvailableActions = @('start')
         BuildReady = $buildReady
         SecurityWarnings = $securityWarnings
+        SetupState = $setupState
     }
 }
 
@@ -1173,6 +1189,10 @@ function Start-GatecraftOmniRoute {
     $sourceHost = $null
     $observedDescendants = [Collections.Generic.Dictionary[int, long]]::new()
     $treeObservationComplete = $true
+    # Ultimo esito del probe: serve a rendere il timeout diagnosticabile invece che
+    # opaco. Un 'readiness-timeout' non dice se l'endpoint non rispondeva o se
+    # rispondeva con un catalogo inutilizzabile, che sono problemi diversi.
+    $lastProbe = $null
 
     if ($Adapter -ceq 'docker-existing') {
         $docker = Get-Command docker -ErrorAction SilentlyContinue
@@ -1235,6 +1255,7 @@ function Start-GatecraftOmniRoute {
             $treeObservationComplete = (Update-GatecraftOmniRouteObservedDescendants -RootId $launchedProcess.Id -Observed $observedDescendants) -and $treeObservationComplete
         }
         $probe = Test-GatecraftOmniRouteEndpoint -Endpoint $Endpoint -TimeoutSeconds 2
+        $lastProbe = $probe
         if ($probe.ProbeState -ceq 'ready') {
             if ($Adapter -ceq 'source-checkout') {
                 $listener = Test-GatecraftOmniRouteLoopbackListener -Port $uri.Port
@@ -1245,6 +1266,44 @@ function Start-GatecraftOmniRoute {
                 }
             }
             return New-GatecraftOmniRouteResult @{ State = 'ready'; Endpoint = $Endpoint.TrimEnd('/'); Probe = $probe; Adapter = $Adapter; ProcessId = if ($null -ne $launchedProcess) { $launchedProcess.Id } else { $null }; ProcessStart = $processStart; RawLogDirectory = if ($null -ne $sourceHost) { $sourceHost.LogDirectory } else { $null } }
+        }
+        # Un'istanza appena installata risponde ma non ha provider: il catalogo e'
+        # vuoto e la readiness non arrivera' mai. Senza questo ramo l'attesa scadeva
+        # come un fallimento generico, lasciando l'operatore a interpretare un
+        # timeout invece di leggere "manca la configurazione". Il processo autorizzato
+        # resta vivo per la sessione di setup attendita, e resta nel manifest di reap.
+        if ($Adapter -ceq 'source-checkout' -and $null -ne $launchedProcess -and -not $launchedProcess.HasExited) {
+            $listener = Test-GatecraftOmniRouteLoopbackListener -Port $uri.Port
+            if ($listener.Verified -and -not $listener.Safe) {
+                # Un listener non-loopback fallisce chiuso anche qui: non si offre mai
+                # all'utente un'istanza esposta come se fosse solo da configurare.
+                Stop-GatecraftOmniRouteTrackedTree -RootProcess $launchedProcess -Observed $observedDescendants -ObservationComplete $treeObservationComplete
+                $diagnostic = Get-GatecraftOmniRouteProcessDiagnostic -LogDirectory $sourceHost.LogDirectory -ResultPath $sourceHost.ResultPath -FallbackReasonCode $listener.ReasonCode
+                return New-GatecraftOmniRouteResult @{ State = 'failed'; Endpoint = $Endpoint.TrimEnd('/'); Adapter = $Adapter; ReasonCode = $listener.ReasonCode; DiagnosticCode = $diagnostic.DiagnosticCode; ExitCode = $diagnostic.ExitCode; OutputTail = $diagnostic.OutputTail; RawLogDirectory = $diagnostic.RawLogDirectory; ListenerAddresses = $listener.Addresses }
+            }
+            if (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings $preflight.SecurityWarnings -SetupState $preflight.SetupState -Probe $probe -Listener $listener) {
+                $diagnostic = Get-GatecraftOmniRouteProcessDiagnostic -LogDirectory $sourceHost.LogDirectory -ResultPath $sourceHost.ResultPath -FallbackReasonCode 'instance-unconfigured'
+                return New-GatecraftOmniRouteResult @{
+                    State = 'needs-action'
+                    ReasonCode = 'instance-unconfigured'
+                    DiagnosticCode = 'instance-unconfigured'
+                    Endpoint = $Endpoint.TrimEnd('/')
+                    DashboardUrl = Get-GatecraftOmniRouteDashboardUrl -Endpoint $Endpoint
+                    Adapter = $Adapter
+                    Mode = $launchRecord.Mode
+                    ProbeReasonCode = $probe.ReasonCode
+                    SecurityWarnings = @($preflight.SecurityWarnings)
+                    SetupState = $preflight.SetupState
+                    RequiredActions = @('login', 'change-initial-password', 'configure-provider', 'retry-readiness')
+                    AvailableActions = @('open-dashboard', 'use-direct-profiles', 'stop-omniroute')
+                    ProcessId = $launchedProcess.Id
+                    ProcessStart = $processStart
+                    KeptRunningForSetup = $true
+                    ListenerAddresses = @($listener.Addresses)
+                    OutputTail = $diagnostic.OutputTail
+                    RawLogDirectory = $diagnostic.RawLogDirectory
+                }
+            }
         }
         if ($null -ne $launchedProcess -and $launchedProcess.HasExited) {
             Stop-GatecraftOmniRouteTrackedTree -RootProcess $launchedProcess -Observed $observedDescendants -ObservationComplete $treeObservationComplete
@@ -1262,7 +1321,7 @@ function Start-GatecraftOmniRoute {
     }
     if ($Adapter -ceq 'source-checkout') {
         $diagnostic = Get-GatecraftOmniRouteProcessDiagnostic -LogDirectory $sourceHost.LogDirectory -ResultPath $sourceHost.ResultPath -FallbackReasonCode 'readiness-timeout'
-        return New-GatecraftOmniRouteResult @{ State = 'failed'; Endpoint = $Endpoint.TrimEnd('/'); Adapter = $Adapter; ReasonCode = $diagnostic.ReasonCode; DiagnosticCode = $diagnostic.DiagnosticCode; ExitCode = $diagnostic.ExitCode; OutputTail = $diagnostic.OutputTail; RawLogDirectory = $diagnostic.RawLogDirectory }
+        return New-GatecraftOmniRouteResult @{ State = 'failed'; Endpoint = $Endpoint.TrimEnd('/'); Adapter = $Adapter; ReasonCode = $diagnostic.ReasonCode; DiagnosticCode = $diagnostic.DiagnosticCode; ExitCode = $diagnostic.ExitCode; OutputTail = $diagnostic.OutputTail; RawLogDirectory = $diagnostic.RawLogDirectory; ProbeReasonCode = if ($null -ne $lastProbe) { $lastProbe.ReasonCode } else { $null }; SecurityWarnings = if ($null -ne $preflight) { @($preflight.SecurityWarnings) } else { @() }; SetupState = if ($null -ne $preflight) { $preflight.SetupState } else { $null } }
     }
     throw 'omniroute-readiness-timeout'
 }
