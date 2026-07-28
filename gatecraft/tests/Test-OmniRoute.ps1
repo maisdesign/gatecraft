@@ -367,6 +367,45 @@ server.listen(port, host);
     Assert-Equal (Get-GatecraftOmniRouteDashboardUrl -Endpoint 'http://localhost:20128') 'http://localhost:20128/dashboard' 'A loopback endpoint must project a dashboard URL.'
     Assert-Equal (Get-GatecraftOmniRouteDashboardUrl -Endpoint 'http://192.168.0.15:20128') $null 'A non-loopback endpoint must never be projected as a clickable dashboard.'
 
+    # Sonda delle corsie: availability non e' usability. Il seam evita un gateway vivo.
+    function Invoke-LaneProbeFixture([int] $Status) {
+        Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request { param($Uri, $Body, $Timeout) $Status }
+    }
+    Assert-Equal (Invoke-LaneProbeFixture 200).Usable $true 'A 2xx response must mark the lane usable.'
+    Assert-Equal (Invoke-LaneProbeFixture 200).Verdict 'permanent' 'A usable lane must be a permanent verdict.'
+    Assert-Equal (Invoke-LaneProbeFixture 413).ReasonCode 'lane-rejected' 'A per-request size cap must reject the lane.'
+    Assert-Equal (Invoke-LaneProbeFixture 413).Verdict 'permanent' 'A size cap is a property of the lane, not a transient fault.'
+    Assert-Equal (Invoke-LaneProbeFixture 400).ReasonCode 'lane-rejected' 'A refused reasoning parameter must reject the lane.'
+    # Il punto della distinzione: un 429 osservato dal vivo ("all credentials are cooling
+    # down") tornava utilizzabile pochi minuti dopo. Trattarlo come rifiuto escluderebbe
+    # per sempre una corsia buona.
+    Assert-Equal (Invoke-LaneProbeFixture 429).Verdict 'transient' 'A rate limit must never become a permanent exclusion.'
+    Assert-Equal (Invoke-LaneProbeFixture 429).ReasonCode 'lane-indeterminate' 'A rate limit must be reported as indeterminate, not rejected.'
+    Assert-Equal (Invoke-LaneProbeFixture 503).Verdict 'transient' 'An upstream fault must stay retryable.'
+    Assert-Equal (Invoke-LaneProbeFixture 408).Verdict 'transient' 'A request timeout must stay retryable.'
+    Assert-Equal (Invoke-LaneProbeFixture 401).ReasonCode 'probe-unauthorized' 'A rejected credential must not be attributed to the model.'
+    Assert-Equal (Invoke-LaneProbeFixture 401).Verdict 'blocked' 'A credential problem must block rather than judge the lane.'
+    $laneTransport = Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request { param($Uri, $Body, $Timeout) throw [System.Net.Http.HttpRequestException]::new('offline') }
+    Assert-Equal $laneTransport.Verdict 'transient' 'A transport failure must never be a permanent verdict.'
+    Assert-Equal $laneTransport.ReasonCode 'lane-unreachable' 'A transport failure must have its own reason code.'
+    Assert-Equal (Test-GatecraftOmniRouteModelLane -Endpoint 'not-an-origin' -ModelId 'probe/model' -Request { param($Uri, $Body, $Timeout) 200 }).ReasonCode 'endpoint-invalid' 'An invalid endpoint must be rejected before any request.'
+
+    # La fedelta' della sonda sta nella forma: senza reasoning e senza tool a dimensione
+    # realistica i due rifiuti osservati non si manifestano affatto.
+    $probeBody = New-GatecraftOmniRouteLaneProbeBody -ModelId 'probe/model'
+    Assert-Equal $probeBody.model 'probe/model' 'The probe body must target the requested model.'
+    Assert-Equal $probeBody.thinking.type 'enabled' 'The probe must enable reasoning, or a refused reasoning parameter goes undetected.'
+    Assert-True (@($probeBody.tools).Count -ge 20) 'The probe must carry a realistic number of tool definitions.'
+    Assert-True (($probeBody | ConvertTo-Json -Depth 8 -Compress).Length -gt 20000) 'The probe body must be worker-sized, or a per-request size cap goes undetected.'
+    $probeJson = $probeBody | ConvertTo-Json -Depth 8 -Compress
+    # Cerca forme di credenziale, non la sottostringa 'token': il corpo contiene
+    # legittimamente max_tokens e budget_tokens, che sono nomi di campo dell'API.
+    Assert-True ($probeJson -notmatch '(?i)(api[_-]?key|client[_-]?secret|bearer\s|password|sk-[a-z0-9])') 'The probe body must carry no credential-shaped content.'
+
+    $probeUri = $null
+    $null = Test-GatecraftOmniRouteModelLane -Endpoint 'http://127.0.0.1:20128' -ModelId 'probe/model' -Request { param($Uri, $Body, $Timeout) $script:capturedProbeUri = $Uri; 200 }
+    Assert-Equal $script:capturedProbeUri 'http://127.0.0.1:20128/v1/messages' 'The probe must target the Anthropic-shaped endpoint the workers use.'
+
     $safeListener = [pscustomobject]@{ Verified = $true; Safe = $true }
     $unsafeListener = [pscustomobject]@{ Verified = $true; Safe = $false }
     Assert-True (Test-GatecraftOmniRouteInstanceUnconfigured -SecurityWarnings @('default-initial-password') -SetupState unknown -Probe $emptyCatalog -Listener $safeListener) 'Concordant evidence must classify an instance as merely unconfigured.'

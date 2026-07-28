@@ -48,6 +48,37 @@ with a reviewed one-off script) and keep two rules:
    small monthly credit allowance highest. Selection prefers the lowest tier, so the ranking decides
    which free lane absorbs ordinary work and which is held back.
 
+Availability is not usability. A route that answers a one-line request can still be
+unusable as a worker lane, and two rejections only appear at realistic size and shape: a free
+tier that caps the per-request payload (HTTP 413 `Request too large`), and a model that refuses
+the reasoning parameter the `anthropic` launch adapter always sends (HTTP 400
+`reasoning_effort is not enabled/supported`). Both were observed on lanes that passed a small
+ping — so a small ping is not evidence.
+
+`omniroute-session.ps1 probe-models -ModelIds <id> [<id> ...]` measures this. Each probe sends a
+worker-shaped request — reasoning enabled, a long system prompt, a realistic set of tool
+definitions — and classifies the outcome:
+
+| `verdict` | Meaning | Use |
+| --- | --- | --- |
+| `permanent` + `usable=true` | The lane accepted a worker-sized request | Catalogue it |
+| `permanent` + `lane-rejected` | Rejected on its own terms (413, 400, …) | Leave it out |
+| `transient` | Rate limit, cooldown, upstream fault, timeout | Unknown — never exclude on this |
+| `blocked` | `probe-unauthorized` / `probe-key-missing` | The credential, not the model; the run stops |
+
+The `transient`/`permanent` split is the point. A `429 all credentials are cooling down` was
+observed on a lane that worked minutes later: treating it as a rejection would permanently
+blacklist a good lane over a temporary limit. Only `permanent` verdicts are evidence.
+
+**Warn the user before starting: this is slow.** The probes run serially and paced on purpose —
+each one is a full-size request, and on a free tier a single probe can take minutes. Running them
+in parallel is the fastest way to trip the very rate limits being measured. Budget minutes per
+model, not seconds, and re-probe anything `transient` later rather than deciding from one run.
+
+The probe reads the OmniRoute key from `OMNIROUTE_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) in the
+inherited environment. It is never persisted, logged, or projected, and a `401`/`403` is reported
+as a credential problem rather than attributed to the model.
+
 Keep `implementer` and `reviewer` on different models. Selection would otherwise route both roles to
 the same lowest-cost lane, and a review produced by the model that wrote the code shares its blind
 spots — the independence the reviewer role exists for is lost silently, with every gate still green.
