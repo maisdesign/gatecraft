@@ -128,33 +128,33 @@ Assert-True (-not $malformed.Ok) 'Malformed holder.json must fail.'
 Assert-Equal $malformed.Code 'lock-record-unreadable' 'Malformed holder.json must report lock-record-unreadable.'
 Write-HolderJson -GitDir $heldCommon -ProcessId $PID -ProcessStart $ownStart
 
-# --- Invoke-CheckMerge: lock held, no baseline in receipt file ---
+# --- Invoke-CheckMerge: lock held, no baseline in receipt file (opted out of review to isolate the baseline check) ---
 $noBaselineFile = Write-ReceiptFile -Lines @('VERIFIED protocol=verification/v2 receipt_id=x phase=postmerge verified_by=v verified_at=2026-07-15T10:00:00Z commit=' + ('c' * 40) + ' main=' + ('d' * 40) + ' artifact_sha=' + ('a' * 64) + ' baseline_ref=b integration_ref=i review_ref=r gate="g" exit=0 result=pass required="" evidence=""')
-$mergeNoBaseline = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $noBaselineFile
+$mergeNoBaseline = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $noBaselineFile -LowRiskNoReviewRequired
 Assert-True (-not $mergeNoBaseline.Ok) 'check-merge must fail without a valid baseline receipt line.'
 Assert-Equal $mergeNoBaseline.Code 'baseline-missing' 'Missing baseline must report baseline-missing.'
 
-# --- Invoke-CheckMerge: lock held, valid baseline present ---
+# --- Invoke-CheckMerge: lock held, valid baseline present, review explicitly opted out ---
 $baselineLine = 'VERIFY_PHASE protocol=verification/v2 receipt_id=baseline-1 phase=baseline verified_by=v verified_at=2026-07-15T10:00:00Z artifact_sha=' + ('a' * 64) + ' gate="g" exit=0 result=observed required="" evidence=""'
 $withBaselineFile = Write-ReceiptFile -Lines @($baselineLine)
-$mergeOk = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile
-Assert-True $mergeOk.Ok 'check-merge must pass with lock held and a valid baseline.'
+$mergeOk = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile -LowRiskNoReviewRequired
+Assert-True $mergeOk.Ok 'check-merge must pass with lock held, a valid baseline, and review explicitly opted out.'
 
-# --- Invoke-CheckMerge: --require-review without --artifact-sha ---
-$mergeMissingArtifact = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile -RequireReview
-Assert-True (-not $mergeMissingArtifact.Ok) '--require-review without --artifact-sha must fail.'
-Assert-Equal $mergeMissingArtifact.Code 'argument-artifact-sha-required' 'Missing artifact-sha must report argument-artifact-sha-required.'
+# --- Invoke-CheckMerge: review is required by DEFAULT -- no flags at all must demand --artifact-sha ---
+$mergeMissingArtifact = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile
+Assert-True (-not $mergeMissingArtifact.Ok) 'check-merge must require review by default (no opt-out, no artifact-sha).'
+Assert-Equal $mergeMissingArtifact.Code 'argument-artifact-sha-required' 'Missing artifact-sha under the default-required-review path must report argument-artifact-sha-required.'
 
-# --- Invoke-CheckMerge: --require-review with artifact-sha but no matching REVIEW_PASS ---
+# --- Invoke-CheckMerge: artifact-sha given (review required by default) but no matching REVIEW_PASS ---
 $artifactSha = 'F' * 64
-$mergeNoReview = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile -RequireReview -ArtifactSha $artifactSha
-Assert-True (-not $mergeNoReview.Ok) 'check-merge with --require-review must fail without a matching REVIEW_PASS.'
+$mergeNoReview = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile -ArtifactSha $artifactSha
+Assert-True (-not $mergeNoReview.Ok) 'check-merge must fail without a matching REVIEW_PASS when review is required (the default).'
 Assert-Equal $mergeNoReview.Code 'review-missing-for-artifact' 'Missing review must report review-missing-for-artifact.'
 
 # --- Invoke-CheckMerge: matching REVIEW_PASS present ---
 $reviewLine = "REVIEW_PASS protocol=verification/v2 receipt_id=review-1 reviewer=r reviewed_at=2026-07-15T10:00:00Z source_id=s review_id=rv artifact_sha=$artifactSha"
 $withReviewFile = Write-ReceiptFile -Lines @($baselineLine, $reviewLine)
-$mergeWithReview = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withReviewFile -RequireReview -ArtifactSha $artifactSha
+$mergeWithReview = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withReviewFile -ArtifactSha $artifactSha
 Assert-True $mergeWithReview.Ok 'check-merge must pass once a REVIEW_PASS bound to the exact artifact_sha exists.'
 
 # --- Invoke-CheckClose: full valid verification/v2 chain ---
@@ -168,14 +168,21 @@ $validChainLines = @(
     "VERIFIED protocol=verification/v2 receipt_id=postmerge-1 phase=postmerge verified_by=v verified_at=2026-07-15T10:00:00Z commit=$commit main=$main artifact_sha=$artifact baseline_ref=baseline-1 integration_ref=integration-1 review_ref=review-1 gate=`"g`" exit=0 result=pass required=`"gate-check`" evidence=`"gate-check`""
 )
 $validChainFile = Write-ReceiptFile -Lines $validChainLines
-$closeOk = Invoke-CheckClose -ReceiptFile $validChainFile
+$closeOk = Invoke-CheckClose -RepositoryRoot $heldRepo -ReceiptFile $validChainFile
 Assert-True $closeOk.Ok "check-close must pass a genuinely complete chain. Detail=$($closeOk.Detail)"
 
 # --- Invoke-CheckClose: missing the postmerge VERIFIED line ---
 $incompleteChainFile = Write-ReceiptFile -Lines $validChainLines[0..2]
-$closeIncomplete = Invoke-CheckClose -ReceiptFile $incompleteChainFile
+$closeIncomplete = Invoke-CheckClose -RepositoryRoot $heldRepo -ReceiptFile $incompleteChainFile
 Assert-True (-not $closeIncomplete.Ok) 'check-close must fail without a postmerge VERIFIED line.'
 Assert-Equal $closeIncomplete.Code 'verification-chain-invalid' 'Incomplete chain must report verification-chain-invalid.'
+
+# --- Invoke-CheckClose: --repository-root is actually threaded into the bd lookup, not ignored (review round 1 finding, codex/lavoro) ---
+$distinctRepoRoot = Join-Path $testRoot 'distinct-repo-root-marker'
+$closeWithBeadId = Invoke-CheckClose -RepositoryRoot $distinctRepoRoot -BeadId 'no-such-bead-id'
+Assert-True (-not $closeWithBeadId.Ok) 'check-close with a --bead-id path (no --receipt-file) must attempt a real bd lookup.'
+Assert-Equal $closeWithBeadId.Code 'verification-bead-unreadable' 'A bd lookup against a bogus bead must report verification-bead-unreadable.'
+Assert-True ($closeWithBeadId.Detail -like "*--directory $distinctRepoRoot*") "The bd invocation must be scoped to the declared --repository-root, not the test process's own CWD. Detail=$($closeWithBeadId.Detail)"
 
 # --- Invoke-CheckPush: no policy file ---
 $noPolicyRepo = New-TestRepository 'no-policy-repo'
@@ -224,7 +231,7 @@ $badCommandResult = Invoke-EnforceGateProcess -Arguments @('bogus-command', '--r
 Assert-Equal $badCommandResult.ExitCode 64 'Unknown command must exit 64.'
 Assert-True ($badCommandResult.Error -match 'code=argument-command-invalid') 'Unknown command must name its exact code.'
 
-$realLockNotHeldResult = Invoke-EnforceGateProcess -Arguments @('check-merge', '--repository-root', $noLockRepo, '--receipt-file', $withBaselineFile)
+$realLockNotHeldResult = Invoke-EnforceGateProcess -Arguments @('check-merge', '--repository-root', $noLockRepo, '--receipt-file', $withBaselineFile, '--low-risk-no-review-required')
 Assert-Equal $realLockNotHeldResult.ExitCode 73 'A real subprocess with no held lock must exit 73.'
 Assert-True ($realLockNotHeldResult.Error -match 'code=lock-not-held') 'A real subprocess with no held lock must name lock-not-held.'
 

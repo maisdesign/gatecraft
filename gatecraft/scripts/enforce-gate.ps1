@@ -6,7 +6,7 @@ Import-Module (Join-Path $PSScriptRoot 'Gatecraft.Protocol.psm1') -Force
 function Write-EnforceGateUsage {
     [Console]::Out.WriteLine(@'
 Usage:
-  enforce-gate.ps1 check-merge --repository-root <absolute-path> (--bead-id <id> | --receipt-file <path>) [--require-review --artifact-sha <64-hex-uppercase>]
+  enforce-gate.ps1 check-merge --repository-root <absolute-path> (--bead-id <id> | --receipt-file <path>) --artifact-sha <64-hex-uppercase> [--low-risk-no-review-required]
   enforce-gate.ps1 check-close --repository-root <absolute-path> (--bead-id <id> | --receipt-file <path>)
   enforce-gate.ps1 check-push --repository-root <absolute-path> --target <branch-name>
 
@@ -18,15 +18,20 @@ silently letting the action through.
 
 check-merge requires: the local cooperative guard (scripts/guard.ps1) is
 currently held by THIS process (matched by PID + canonical process start
-against <git-common-dir>/gatecraft-local-guard-v1/holder.json); and a valid
-VERIFY_PHASE phase=baseline result=observed receipt line exists for the bead.
-With --require-review, a REVIEW_PASS line bound to the exact --artifact-sha is
-also required. This check is deliberately lighter than scripts/guard.ps1
-itself: it is a read-only informational precondition, not a lifecycle
-mutation, so it does not pin native process handles the way guard.ps1 does --
-a lock released a moment after this check runs is a real (if narrow) gap the
-same class as any TOCTOU check, accepted here because the alternative (no
-check at all) is strictly worse.
+against <git-common-dir>/gatecraft-local-guard-v1/holder.json); a valid
+VERIFY_PHASE phase=baseline result=observed receipt line exists for the bead;
+and, by DEFAULT, a REVIEW_PASS line bound to the exact --artifact-sha. Review
+is required unless the caller explicitly opts out with
+--low-risk-no-review-required (deliberately long and hard to pass by accident
+-- review round 1 finding, codex/lavoro: an opt-in `--require-review` flag
+left the safe behavior dependent on the caller remembering to add it on every
+sensitive-path call, the exact prose-discipline failure mode this bead exists
+to close). This check is deliberately lighter than scripts/guard.ps1 itself:
+it is a read-only informational precondition, not a lifecycle mutation, so it
+does not pin native process handles the way guard.ps1 does -- a lock released
+a moment after this check runs is a real (if narrow) gap the same class as
+any TOCTOU check, accepted here because the alternative (no check at all) is
+strictly worse.
 
 check-close requires the full verification/v2 chain (baseline, integration/
 premerge, optional review, postmerge VERIFIED) to validate with zero issues,
@@ -121,10 +126,15 @@ function Test-LocalGuardHeldByCurrentProcess {
 }
 
 function Get-BeadReceiptLines {
-    param([Parameter(Mandatory)][string] $BeadId)
-    $json = & bd comments $BeadId --json 2>$null
+    # `--directory` is bd's own `-C`-equivalent (review round 1 finding,
+    # codex/lavoro): without it, `bd comments` resolved its database from
+    # THIS PROCESS's current working directory, not the declared
+    # --repository-root, so a caller invoking enforce-gate.ps1 from anywhere
+    # else could silently read the wrong bd database or fail outright.
+    param([Parameter(Mandatory)][string] $BeadId, [Parameter(Mandatory)][string] $RepositoryRoot)
+    $json = & bd comments $BeadId --json --directory $RepositoryRoot 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$json)) {
-        return [pscustomobject]@{ Ok = $false; Code = 'verification-bead-unreadable'; Detail = "'bd comments $BeadId --json' failed or returned nothing."; Value = @() }
+        return [pscustomobject]@{ Ok = $false; Code = 'verification-bead-unreadable'; Detail = "'bd comments $BeadId --json --directory $RepositoryRoot' failed or returned nothing."; Value = @() }
     }
     try { $comments = $json | ConvertFrom-Json }
     catch { return [pscustomobject]@{ Ok = $false; Code = 'verification-bead-unreadable'; Detail = "'bd comments $BeadId --json' output is not valid JSON."; Value = @() } }
@@ -145,7 +155,7 @@ function Get-BeadReceiptLines {
 }
 
 function Get-ReceiptLinesForCheck {
-    param([string] $BeadId, [string] $ReceiptFile)
+    param([string] $BeadId, [string] $ReceiptFile, [string] $RepositoryRoot)
     if ($ReceiptFile) {
         if (-not (Test-Path -LiteralPath $ReceiptFile -PathType Leaf)) {
             return [pscustomobject]@{ Ok = $false; Code = 'argument-receipt-file-missing'; Detail = "--receipt-file '$ReceiptFile' does not exist."; Value = @() }
@@ -153,21 +163,28 @@ function Get-ReceiptLinesForCheck {
         $lines = @(Get-Content -LiteralPath $ReceiptFile)
         return [pscustomobject]@{ Ok = $true; Code = 'ok'; Detail = ''; Value = $lines }
     }
-    return Get-BeadReceiptLines -BeadId $BeadId
+    return Get-BeadReceiptLines -BeadId $BeadId -RepositoryRoot $RepositoryRoot
 }
 
 function Invoke-CheckMerge {
-    param([string] $RepositoryRoot, [string] $BeadId, [string] $ReceiptFile, [switch] $RequireReview, [string] $ArtifactSha)
+    # Review is required by DEFAULT (review round 1 finding, codex/lavoro): an
+    # opt-in `--require-review` flag left the safe behavior dependent on the
+    # caller remembering to add it, exactly the prose-discipline failure mode
+    # this whole bead exists to close. `-LowRiskNoReviewRequired` is the only
+    # way to skip it -- a long, deliberately hard-to-pass-by-accident name, so
+    # skipping review is something a caller must consciously choose to type,
+    # never the silent default of omitting a flag.
+    param([string] $RepositoryRoot, [string] $BeadId, [string] $ReceiptFile, [switch] $LowRiskNoReviewRequired, [string] $ArtifactSha)
 
     if (-not $BeadId -and -not $ReceiptFile) { return [pscustomobject]@{ Ok = $false; Code = 'argument-bead-id-or-receipt-file-required' } }
-    if ($RequireReview -and -not $ArtifactSha) { return [pscustomobject]@{ Ok = $false; Code = 'argument-artifact-sha-required'; Detail = '--require-review needs --artifact-sha to bind the review to the exact merge candidate.' } }
+    if (-not $LowRiskNoReviewRequired -and -not $ArtifactSha) { return [pscustomobject]@{ Ok = $false; Code = 'argument-artifact-sha-required'; Detail = 'Review is required by default; pass --artifact-sha to bind it to the exact merge candidate, or explicitly opt out with --low-risk-no-review-required.' } }
 
     $commonResult = Get-GitCommonDirectory -RepositoryRoot $RepositoryRoot
     if (-not $commonResult.Ok) { return $commonResult }
     $lockResult = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $commonResult.Value
     if (-not $lockResult.Ok) { return $lockResult }
 
-    $linesResult = Get-ReceiptLinesForCheck -BeadId $BeadId -ReceiptFile $ReceiptFile
+    $linesResult = Get-ReceiptLinesForCheck -BeadId $BeadId -ReceiptFile $ReceiptFile -RepositoryRoot $RepositoryRoot
     if (-not $linesResult.Ok) { return $linesResult }
 
     $baselineFound = $false
@@ -176,23 +193,23 @@ function Invoke-CheckMerge {
         $parsed = ConvertFrom-GatecraftReceiptLine -Line $line
         if (-not $parsed.IsValid) { continue }
         if ($parsed.Type -ceq 'VERIFY_PHASE' -and $parsed.Fields['phase'] -ceq 'baseline' -and $parsed.Fields['result'] -ceq 'observed') { $baselineFound = $true }
-        if ($RequireReview -and $parsed.Type -ceq 'REVIEW_PASS' -and $parsed.Fields['artifact_sha'] -ceq $ArtifactSha) { $reviewPassFound = $true }
+        if (-not $LowRiskNoReviewRequired -and $parsed.Type -ceq 'REVIEW_PASS' -and $parsed.Fields['artifact_sha'] -ceq $ArtifactSha) { $reviewPassFound = $true }
     }
     if (-not $baselineFound) {
         return [pscustomobject]@{ Ok = $false; Code = 'baseline-missing'; Detail = "No valid 'VERIFY_PHASE ... phase=baseline result=observed' receipt line found." }
     }
-    if ($RequireReview -and -not $reviewPassFound) {
+    if (-not $LowRiskNoReviewRequired -and -not $reviewPassFound) {
         return [pscustomobject]@{ Ok = $false; Code = 'review-missing-for-artifact'; Detail = "No 'REVIEW_PASS' receipt line bound to artifact_sha=$ArtifactSha found." }
     }
     return [pscustomobject]@{ Ok = $true; Code = 'ok'; Detail = '' }
 }
 
 function Invoke-CheckClose {
-    param([string] $BeadId, [string] $ReceiptFile)
+    param([string] $RepositoryRoot, [string] $BeadId, [string] $ReceiptFile)
 
     if (-not $BeadId -and -not $ReceiptFile) { return [pscustomobject]@{ Ok = $false; Code = 'argument-bead-id-or-receipt-file-required' } }
 
-    $linesResult = Get-ReceiptLinesForCheck -BeadId $BeadId -ReceiptFile $ReceiptFile
+    $linesResult = Get-ReceiptLinesForCheck -BeadId $BeadId -ReceiptFile $ReceiptFile -RepositoryRoot $RepositoryRoot
     if (-not $linesResult.Ok) { return $linesResult }
 
     # Test-GatecraftVerificationChain returns one summary object (.Decision/.Reasons/
@@ -245,7 +262,7 @@ function Read-EnforceGateArguments {
     if ($command -cnotin @('check-merge', 'check-close', 'check-push')) { Complete-EnforceGate -Code 'argument-command-invalid' -Detail "'$command' is not check-merge, check-close, or check-push." }
 
     $allowedByCommand = @{
-        'check-merge' = @('--repository-root', '--bead-id', '--receipt-file', '--require-review', '--artifact-sha')
+        'check-merge' = @('--repository-root', '--bead-id', '--receipt-file', '--low-risk-no-review-required', '--artifact-sha')
         'check-close' = @('--repository-root', '--bead-id', '--receipt-file')
         'check-push' = @('--repository-root', '--target')
     }
@@ -255,7 +272,7 @@ function Read-EnforceGateArguments {
     while ($index -lt $Tokens.Count) {
         $token = [string]$Tokens[$index]
         if ($token -cnotin $allowed) { Complete-EnforceGate -Code 'argument-flag-unknown' -Detail "'$token' is not valid for $command." }
-        if ($token -ceq '--require-review') { $values[$token] = 'true'; $index++; continue }
+        if ($token -ceq '--low-risk-no-review-required') { $values[$token] = 'true'; $index++; continue }
         if ($index + 1 -ge $Tokens.Count) { Complete-EnforceGate -Code 'argument-value-missing' -Detail "'$token' requires a value." }
         $values[$token] = [string]$Tokens[$index + 1]
         $index += 2
@@ -276,10 +293,10 @@ if ($MyInvocation.InvocationName -ne '.') {
     $result = switch ($parsed.Command) {
         'check-merge' {
             Invoke-CheckMerge -RepositoryRoot $repositoryRoot -BeadId $parsed.Values['--bead-id'] -ReceiptFile $parsed.Values['--receipt-file'] `
-                -RequireReview:($parsed.Values.ContainsKey('--require-review')) -ArtifactSha $parsed.Values['--artifact-sha']
+                -LowRiskNoReviewRequired:($parsed.Values.ContainsKey('--low-risk-no-review-required')) -ArtifactSha $parsed.Values['--artifact-sha']
         }
         'check-close' {
-            Invoke-CheckClose -BeadId $parsed.Values['--bead-id'] -ReceiptFile $parsed.Values['--receipt-file']
+            Invoke-CheckClose -RepositoryRoot $repositoryRoot -BeadId $parsed.Values['--bead-id'] -ReceiptFile $parsed.Values['--receipt-file']
         }
         'check-push' {
             Invoke-CheckPush -RepositoryRoot $repositoryRoot -Target $parsed.Values['--target']
