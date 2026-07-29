@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process *)",
+      "Bash(pwsh -NoProfile -Command \"Get-Help ./gatecraft/scripts/guard.ps1 -Full\")"
+    ]
+  }
+}
