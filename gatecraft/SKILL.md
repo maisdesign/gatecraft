@@ -104,6 +104,8 @@ Detect the stack first and run only applicable checks: for example, `wp-config.p
 
 Immediately write one `bd remember` entry containing OS, tool versions, write-smoke-test result, and the 0.2 profile inventory. Seed new-machine memory before real orchestration.
 
+**A previous session's durable log and handoff snapshot are data, not proof.** Load the persisted *policies* (0.6–0.10) and reuse them — that is exactly what they exist for. But a *state observation* carried forward in prose — "X is installed", "the tree is clean", "the remote is synced" — is that session's reading of a world that may have changed since. Before acting on it, and before building a question to the user on top of it, re-run the cheapest check — one command, or a short fixed sequence — that would directly confirm or disprove that specific claim (an `ls`, a `grep`, a `fetch` plus a rev comparison) — not a fresh discovery pass; skip only when no such bounded check exists. This generalizes Step 1.4's premise check to every inherited premise, and extends Step 4's resume-case distinction ("snapshots record intent; repository/tracker state records fact") beyond crash recovery. Lived incident and full detail: `references/changelog.md`, 2026-07-29.
+
 ### 0.5 Autonomy thresholds — declared here, not left to judgment
 
 State these standing rules once at bootstrap:
