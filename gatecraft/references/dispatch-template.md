@@ -18,6 +18,9 @@ Definition of done (run this yourself before reporting done):
 <exact command(s), e.g. `wp-cli eval-file test.php` or `npm test -- --grep "cart"` — from Step 2>
 
 Tool invocation pattern for this project (from Step 0.3): <exact path/flags, e.g. LocalWP php/wp-cli paths>
+Gateway mode (from per-session GC-0.2): <direct|omniroute; decision source; sanitized endpoint origin>
+Model/routing requirement: <explicit model+thinking, or approved ordinary-implementer automatic route>
+Compression boundary: <disabled|ordinary-context-only; protocol, commands, receipts, and evidence are never compressed>
 
 Constraints:
 - Do not read or output the contents of .env, credentials, API keys, or any secret/credential file.

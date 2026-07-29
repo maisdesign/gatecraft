@@ -12,3 +12,6 @@ log/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# bd-mission-control generated dashboard snapshot (build artifact, may mirror bead text)
+docs/orchestration-data.js

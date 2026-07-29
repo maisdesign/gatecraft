@@ -84,6 +84,11 @@ $receiptProtocolPath = Join-Path $repoRoot 'gatecraft/references/receipt-protoco
 $recoveryProtocolPath = Join-Path $repoRoot 'gatecraft/references/recovery-protocol.md'
 $cycleEndReferencePath = Join-Path $repoRoot 'gatecraft/references/cycle-end.md'
 $localGuardReferencePath = Join-Path $repoRoot 'gatecraft/references/local-guard.md'
+$omniRouteReferencePath = Join-Path $repoRoot 'gatecraft/references/omniroute.md'
+$omniRouteModulePath = Join-Path $repoRoot 'gatecraft/scripts/OmniRoute.psm1'
+$omniRouteEntryPointPath = Join-Path $repoRoot 'gatecraft/scripts/omniroute-session.ps1'
+$omniRouteProcessHostPath = Join-Path $repoRoot 'gatecraft/scripts/omniroute-process-host.ps1'
+$omniRouteTestPath = Join-Path $repoRoot 'gatecraft/tests/Test-OmniRoute.ps1'
 $protocolModulePath = Join-Path $repoRoot 'gatecraft/scripts/Gatecraft.Protocol.psm1'
 $guardScriptPath = Join-Path $repoRoot 'gatecraft/scripts/guard.ps1'
 $guardShellPath = Join-Path $repoRoot 'gatecraft/scripts/guard.sh'
@@ -108,6 +113,11 @@ $receiptProtocol = Read-RequiredText -Path $receiptProtocolPath -Label 'Receipt 
 $recoveryProtocol = Read-RequiredText -Path $recoveryProtocolPath -Label 'Recovery protocol reference'
 $cycleEndReference = Read-RequiredText -Path $cycleEndReferencePath -Label 'Cycle-end reference'
 $localGuardReference = Read-RequiredText -Path $localGuardReferencePath -Label 'Local guard reference'
+$omniRouteReference = Read-RequiredText -Path $omniRouteReferencePath -Label 'OmniRoute integration reference'
+$omniRouteModule = Read-RequiredText -Path $omniRouteModulePath -Label 'OmniRoute deterministic helper'
+$omniRouteEntryPoint = Read-RequiredText -Path $omniRouteEntryPointPath -Label 'OmniRoute session entry point'
+$omniRouteProcessHost = Read-RequiredText -Path $omniRouteProcessHostPath -Label 'OmniRoute bounded process host'
+$omniRouteTest = Read-RequiredText -Path $omniRouteTestPath -Label 'OmniRoute behavioral gate'
 $protocolModule = Read-RequiredText -Path $protocolModulePath -Label 'Receipt protocol module'
 $guardScript = Read-RequiredText -Path $guardScriptPath -Label 'Guard PowerShell entry point'
 $guardShell = Read-RequiredText -Path $guardShellPath -Label 'Guard POSIX entry point'
@@ -711,6 +721,44 @@ Assert-Match -Text $contract -Pattern 'user-approved project \.gitignore rule.+l
 Assert-Match -Text $skill -Pattern 'without silently editing the user''s tracked `\.gitignore`' -Message 'SKILL.md must retain the target-repository ignore boundary inline.'
 Assert-Match -Text (Read-RequiredText -Path (Join-Path $repoRoot 'gatecraft/references/handoff-protocol.md') -Label 'Handoff protocol') -Pattern 'tiers below apply only when a trustworthy short-session value is available' -Message 'Handoff tiers must never use weekly-only usage.'
 
+# Optional OmniRoute onboarding remains consent-bound, local, and non-secret.
+Assert-Match -Text $contract -Pattern 'Check and resolve the optional OmniRoute installation/use policy.+at the start of every orchestration session' -Message 'GC-0.2 must resolve OmniRoute every session.'
+Assert-Match -Text $contract -Pattern 'omniroute-session\.ps1 status' -Message 'GC-0.2 must invoke the executable OmniRoute status path.'
+Assert-Match -Text $contract -Pattern 'resolve-policy -RepositoryRoot <target-repo>' -Message 'GC-0.2 must invoke executable session/project/global policy resolution.'
+Assert-Match -Text $skill -Pattern 'never trust a persisted installed boolean' -Message 'SKILL.md must separate observed installation state from preferences.'
+Assert-Match -Text $omniRouteReference -Pattern 'Installation and use are separate decisions' -Message 'OmniRoute install consent must not imply use consent.'
+Assert-Match -Text $omniRouteReference -Pattern '(?s)Session choice.+Project policy.+Global preferences' -Message 'OmniRoute reference must define session, project, and global policy levels.'
+Assert-Match -Text $omniRouteReference -Pattern 'session choice, project policy, global policy' -Message 'OmniRoute reference must define deterministic precedence.'
+Assert-Match -Text $omniRouteReference -Pattern 'Never persist `installed=true` or `installed=false`' -Message 'OmniRoute reference must prohibit stale installed flags.'
+Assert-Match -Text $omniRouteReference -Pattern 'Never install from silence' -Message 'OmniRoute installation must require direct consent.'
+Assert-Match -Text $omniRouteReference -Pattern 'Do not run `setup-claude`, `setup-codex`' -Message 'Session activation must not rewrite ordinary CLI configuration.'
+Assert-Match -Text $omniRouteReference -Pattern 'Never compress or rewrite the dispatch contract fields' -Message 'Compression must exclude protocol and evidence fields.'
+Assert-Match -Text $omniRouteReference -Pattern 'closed typed record, not a command' -Message 'Startup persistence must be an adapter registry, not a shell-command store.'
+Assert-Match -Text $omniRouteReference -Pattern 'bounded `discover-adapters` entry-point command' -Message 'Unknown installations must have a bounded multi-adapter discovery path.'
+Assert-Match -Text $skill -Pattern 'modified official source checkout stays `installed-stopped`' -Message 'Per-session orchestration must retain dirty official checkout discovery without persisting startup authority.'
+Assert-Match -Text $omniRouteModule -Pattern 'omniroute-install-direct-confirmation-required' -Message 'The installer helper must mechanically require direct confirmation.'
+Assert-Match -Text $omniRouteModule -Pattern "'native-cli', 'docker-existing'" -Message 'Autostart must be limited to typed adapters.'
+Assert-Match -Text $omniRouteModule -Pattern 'omniroute-adapter-direct-confirmation-required' -Message 'Registering a discovered startup adapter must require direct confirmation.'
+Assert-Match -Text $omniRouteModule -Pattern 'adapter-identity-drift' -Message 'Startup must fail on adapter identity drift.'
+Assert-Match -Text $omniRouteModule -Pattern 'Kill\(\$true\)' -Message 'A failed directly launched gateway must reap its process tree.'
+Assert-Match -Text $omniRouteEntryPoint -Pattern "'status'.+'get-preferences'.+'resolve-policy'.+'discover-adapters'.+'register-adapter'.+'start'.+'install-plan'.+'install'" -Message 'The OmniRoute runtime entry point must wire status, policy, adapter discovery/start, and install operations.'
+Assert-Match -Text $omniRouteEntryPoint -Pattern "'preflight'.+'build-plan'.+'build'" -Message 'The OmniRoute runtime entry point must expose source preflight and separately confirmed build operations.'
+Assert-Match -Text $omniRouteModule -Pattern '\.build/next/BUILD_ID' -Message 'Production source start must preflight the canonical non-empty Next build marker.'
+Assert-Match -Text $omniRouteModule -Pattern 'production-build-missing' -Message 'Missing production build must have a stable structured reason.'
+Assert-Match -Text $omniRouteProcessHost -Pattern "'HOST'\] = '127\.0\.0\.1'" -Message 'Managed source startup must force loopback host binding.'
+Assert-Match -Text $omniRouteModule -Pattern 'Test-GatecraftOmniRouteLoopbackListener' -Message 'Managed source readiness must verify actual listener addresses.'
+Assert-Match -Text $omniRouteProcessHost -Pattern "ValidateSet\('source-start', 'source-build'\)" -Message 'The process host must remain closed to typed source start/build purposes.'
+Assert-Match -Text $omniRouteProcessHost -Pattern "MaxFileBytes = 65536" -Message 'Raw source process logs must have a fixed per-file bound.'
+Assert-Match -Text $omniRouteProcessHost -Pattern '\^gatecraft-omniroute-process-\[a-f0-9\]' -Message 'The process host must restrict output to a dedicated randomized system-temp directory.'
+Assert-Match -Text $omniRouteModule -Pattern 'OutputTail.+RawLogDirectory' -Message 'Source startup failure must return bounded diagnostics and the local raw-log location.'
+Assert-Match -Text $omniRouteEntryPoint -Pattern '(?s)runtime_module_sha256.+runtime_entrypoint_sha256.+runtime_process_host_sha256' -Message 'Status must expose hash-bound runtime identity for stale-copy diagnosis.'
+Assert-Match -Text $omniRouteModule -Pattern 'process-host-launch-failed' -Message 'Pre-process host failures must return a structured diagnostic instead of raw method exceptions.'
+Assert-NotMatch -Text $omniRouteModule -Pattern '(?i)npm\s+run\s+build' -Message 'Gatecraft must not execute mutable npm build script text.'
+Assert-NotMatch -Text $omniRouteModule -Pattern '(?i)Invoke-Expression|\biex\b' -Message 'OmniRoute helper must not execute shell strings.'
+Assert-Match -Text $omniRouteTest -Pattern 'Preferences must not persist observed installation state or secrets' -Message 'OmniRoute test must enforce the preference secret/state boundary.'
+Assert-Match -Text $dispatch -Pattern '(?m)^Gateway mode \(from per-session GC-0\.2\):' -Message 'Dispatch template must carry the selected gateway mode.'
+Assert-Match -Text $dispatch -Pattern '(?m)^Compression boundary:' -Message 'Dispatch template must make compression boundaries explicit.'
+
 # README truth in both languages and repository layout.
 $englishMatch = [regex]::Match($readme, '(?s)### Orchestrator seat compatibility(?<body>.*?)(?=### Repository layout)')
 $italianMatch = [regex]::Match($readme, '(?s)### Compatibilità della sedia dell''orchestratore(?<body>.*?)(?=### Struttura del repository)')
@@ -735,9 +783,9 @@ if ($italianMatch.Success) {
 Assert-NotMatch -Text $readme -Pattern 'orchestrator role is Claude Code.specific' -Message 'README must not claim that the orchestrator role is Claude-only.'
 Assert-NotMatch -Text $readme -Pattern 'ruolo di orchestratore è specifico di Claude Code' -Message 'README Italian must not claim that the orchestrator role is Claude-only.'
 foreach ($newFile in @(
-    'execution-contract.md', 'local-guard.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md', 'recovery-protocol.md',
-    'Gatecraft.Protocol.psm1', 'guard.ps1', 'guard.sh', 'cycle-end.ps1', 'cycle-end.sh',
-    'Test-Guard.ps1', 'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-RecoveryProtocol.ps1', 'Test-ProtocolContract.ps1'
+    'execution-contract.md', 'local-guard.md', 'cycle-end.md', 'evidence-hygiene.md', 'receipt-protocol.md', 'recovery-protocol.md', 'omniroute.md',
+    'Gatecraft.Protocol.psm1', 'OmniRoute.psm1', 'omniroute-session.ps1', 'omniroute-process-host.ps1', 'guard.ps1', 'guard.sh', 'cycle-end.ps1', 'cycle-end.sh',
+    'Test-Guard.ps1', 'Test-CycleEnd.ps1', 'Test-ReceiptProtocol.ps1', 'Test-RecoveryProtocol.ps1', 'Test-OmniRoute.ps1', 'Test-ProtocolContract.ps1'
 )) {
     $count = [regex]::Matches($readme, [regex]::Escape($newFile)).Count
     Assert-True -Condition ($count -ge 2) -Message "README repository layouts must list $newFile in both languages; found $count occurrence(s)."
@@ -747,6 +795,9 @@ Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecr
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-RecoveryProtocol\.ps1')).Count -ge 2) -Message 'README must give the exact recovery gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-CycleEnd\.ps1')).Count -ge 2) -Message 'README must give the exact cycle-end gate command in both languages.'
 Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-Guard\.ps1')).Count -ge 2) -Message 'README must give the exact guard gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'pwsh -NoProfile -File gatecraft/tests/Test-OmniRoute\.ps1')).Count -ge 2) -Message 'README must give the exact OmniRoute gate command in both languages.'
+Assert-True -Condition (([regex]::Matches($readme, 'OmniRoute is never required')).Count -ge 1) -Message 'README English must state that OmniRoute is optional.'
+Assert-True -Condition (([regex]::Matches($readme, 'OmniRoute non è mai obbligatorio')).Count -ge 1) -Message 'README Italian must state that OmniRoute is optional.'
 
 if ($failures.Count -gt 0) {
     [Console]::Error.WriteLine("Protocol contract gate failed with $($failures.Count) issue(s):")

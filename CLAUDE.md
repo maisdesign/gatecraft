@@ -1,5 +1,9 @@
 # Project Instructions for AI Agents
 
+## Language (hard rule, overrides everything else in this file)
+
+Reply ONLY in Italian or English — match whichever the user just used. NEVER Portuguese, Spanish, French, or any other language, even mixed mid-sentence. This is non-negotiable; no exceptions for casual/caveman phrasing.
+
 This file provides instructions and context for AI coding agents working on this project.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
