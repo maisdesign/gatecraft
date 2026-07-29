@@ -29,13 +29,39 @@ function Assert-Equal {
     }
 }
 
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('gatecraft-model-catalog-wiring-' + [Guid]::NewGuid().ToString('N'))
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+$fixturePrefix = 'gatecraft-model-catalog-wiring-'
+$testRoot = Join-Path ([IO.Path]::GetTempPath()) ($fixturePrefix + [Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($testRoot)
+
+function Remove-FixtureRoot {
+    # Verified, fail-visible cleanup (review round 2 finding, codex/lavoro: a
+    # SilentlyContinue Remove-Item that never checks whether the directory
+    # actually disappeared is the same leak, just silent). Refuses to touch
+    # anything whose resolved path isn't directly under the real temp root
+    # with the exact expected prefix, matching Test-CycleEnd.ps1's own
+    # hardened fixture-cleanup pattern.
+    param([Parameter(Mandatory)][string] $Path)
+    if (-not [IO.Directory]::Exists($Path)) { return }
+    try {
+        $declared = [IO.Path]::GetFullPath($Path)
+        $resolved = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).ProviderPath)
+        $leaf = [IO.Path]::GetFileName($resolved)
+        $parent = [IO.Path]::GetDirectoryName($resolved).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        if ($resolved -cne $declared -or $parent -cne $tempRoot -or -not $leaf.StartsWith($fixturePrefix, [StringComparison]::Ordinal)) {
+            throw "Refuse fixture cleanup outside the exact unique temp root: $resolved"
+        }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+        if ([IO.Directory]::Exists($resolved)) { throw "Fixture cleanup did not remove $resolved" }
+    }
+    catch {
+        Add-Failure "Cleanup failure for ${Path}: $($_.Exception.Message)"
+    }
+}
+
 # Clean up the scratch fixture directory even on an unexpected terminating
-# error, not only the normal exit path below (review finding, codex/lavoro:
-# an earlier version left 9 residual directories in %TEMP% after repeated
-# runs, including on error paths).
-trap { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue } }
+# error, not only the normal exit path below.
+trap { Remove-FixtureRoot -Path $testRoot }
 
 function Write-CatalogFixture {
     param([string] $GeneratedAt, [switch] $Malformed)
@@ -146,7 +172,7 @@ else {
     }
 }
 
-if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+Remove-FixtureRoot -Path $testRoot
 
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { [Console]::Error.WriteLine("ASSERTION FAILED: $failure") }
