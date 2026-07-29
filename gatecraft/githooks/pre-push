@@ -33,10 +33,21 @@ fi
 zero_sha="0000000000000000000000000000000000000000"
 status=0
 while read -r local_ref local_sha remote_ref remote_sha; do
-    if [ -z "$local_ref" ] || [ "$local_sha" = "$zero_sha" ]; then
+    if [ -z "$local_ref" ]; then
         continue
     fi
-    branch=$(printf '%s' "$local_ref" | sed -e 's|^refs/heads/||')
+    if [ "$local_sha" = "$zero_sha" ]; then
+        # A ref DELETION (`git push --delete`/`git push origin :branch`) --
+        # still enforced, not skipped (review round 2 finding, codex/lavoro:
+        # the original zero-sha check was meant to skip a genuinely empty/
+        # malformed stdin line, but it also silently let every delete push
+        # through unchecked, bypassing even a manual-only policy). local_ref
+        # reads as the literal token "(delete)" here, not a real ref path,
+        # so the target branch name comes from remote_ref instead.
+        branch=$(printf '%s' "$remote_ref" | sed -e 's|^refs/heads/||')
+    else
+        branch=$(printf '%s' "$local_ref" | sed -e 's|^refs/heads/||')
+    fi
     pwsh -NoLogo -NoProfile -File "$enforce_gate" check-push --repository-root "$repo_root" --target "$branch"
     rc=$?
     if [ $rc -ne 0 ]; then

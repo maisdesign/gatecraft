@@ -164,6 +164,39 @@ Assert-Equal $markedPassingPushResult.ExitCode 0 "A marked push matching an expl
 $remoteMainAfterPass = Invoke-GitAsEnv -RepositoryPath $markedPassingPushRepo -Arguments @('ls-remote', 'origin', 'refs/heads/main')
 Assert-True ($remoteMainAfterPass.Output.Trim() -ne '') 'A successfully hook-approved push must actually move the remote ref.'
 
+# --- pre-push: a ref DELETION must be enforced too, not silently skipped as a zero-sha line (review round 2 finding, codex/lavoro) ---
+$deletePushRepo = New-TestRepository 'delete-push-repo'
+$deletePushRemote = Join-Path $testRoot 'delete-push-remote.git'
+Invoke-GitAsEnv -RepositoryPath $testRoot -Arguments @('init', '--quiet', '--bare', $deletePushRemote) | Out-Null
+Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('remote', 'add', 'origin', $deletePushRemote) | Out-Null
+Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('checkout', '-b', 'disposable', '--quiet') | Out-Null
+[IO.File]::WriteAllText((Join-Path $deletePushRepo 'disposable.txt'), "disposable`n")
+Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('add', '-A') | Out-Null
+Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('commit', '-m', 'disposable', '--quiet') | Out-Null
+# Push it unmarked first so the remote actually has something to delete.
+Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('push', 'origin', 'disposable') | Out-Null
+[void][IO.Directory]::CreateDirectory((Join-Path $deletePushRepo '.beads'))
+(@{ protocol = 'gatecraft-push-policy/v1'; mode = 'branch-only'; authorized_branch = 'main' } | ConvertTo-Json) |
+    Set-Content -LiteralPath (Join-Path $deletePushRepo '.beads/gatecraft-push-policy.json') -Encoding utf8
+# Policy only authorizes 'main' -- an automated delete of 'disposable' must be BLOCKED, and the remote branch must survive.
+$deleteBlockedResult = Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('push', 'origin', '--delete', 'disposable') -EnvVars @{ GATECRAFT_AUTOMATED_PUSH = '1' }
+Assert-True ($deleteBlockedResult.ExitCode -ne 0) "An automated ref-deletion push for an unauthorized branch must be BLOCKED, not silently skipped as a zero-sha line. stdout=$($deleteBlockedResult.Output) stderr=$($deleteBlockedResult.Error)"
+$disposableAfterBlock = Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('ls-remote', 'origin', 'refs/heads/disposable')
+Assert-True ($disposableAfterBlock.Output.Trim() -ne '') 'A blocked delete-push must leave the remote branch intact, not deleted.'
+# Re-authorize 'disposable' and confirm the delete IS allowed through when the policy actually permits it.
+(@{ protocol = 'gatecraft-push-policy/v1'; mode = 'branch-only'; authorized_branch = 'disposable' } | ConvertTo-Json) |
+    Set-Content -LiteralPath (Join-Path $deletePushRepo '.beads/gatecraft-push-policy.json') -Encoding utf8
+$deleteAllowedResult = Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('push', 'origin', '--delete', 'disposable') -EnvVars @{ GATECRAFT_AUTOMATED_PUSH = '1' }
+Assert-Equal $deleteAllowedResult.ExitCode 0 "An authorized ref-deletion push must be allowed through end-to-end. stdout=$($deleteAllowedResult.Output) stderr=$($deleteAllowedResult.Error)"
+$disposableAfterAllow = Invoke-GitAsEnv -RepositoryPath $deletePushRepo -Arguments @('ls-remote', 'origin', 'refs/heads/disposable')
+Assert-Equal $disposableAfterAllow.Output.Trim() '' 'An authorized delete-push must actually remove the remote branch.'
+
+# --- the two real hook files must be tracked as executable in git's own tree (review round 2 finding, codex/lavoro: a 100644 hook is silently inert on POSIX Git, and Windows never surfaces that failure mode locally) ---
+foreach ($hookName in @('pre-merge-commit', 'pre-push')) {
+    $lsFilesResult = Invoke-GitAsEnv -RepositoryPath $repoRoot -Arguments @('ls-files', '-s', "gatecraft/githooks/$hookName")
+    Assert-True ($lsFilesResult.Output.TrimStart().StartsWith('100755')) "gatecraft/githooks/$hookName must be tracked with the executable git file mode (100755), or POSIX Git can silently refuse to run it as a hook even though core.hooksPath is set correctly. git ls-files -s output=$($lsFilesResult.Output)"
+}
+
 # --- install-githooks.ps1: sets core.hooksPath, is idempotent, and refuses to silently overwrite a pre-existing different hooksPath ---
 # install-githooks.ps1 expects the TARGET repo to carry its own gatecraft/
 # skill-folder copy (the real deployment shape for a host project), so each
