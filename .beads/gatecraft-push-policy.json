@@ -1,0 +1,7 @@
+{
+  "protocol": "gatecraft-push-policy/v1",
+  "mode": "manual-only",
+  "authorized_branch": null,
+  "decided_at": "2026-07-22",
+  "note": "Structured mirror of the standing 0.9 answer already persisted in bd remember (gatecraft-bootstrap-progress): never auto-push; local verified merges to main are fine, push waits for the user. enforce-gate.ps1 check-push reads this file mechanically instead of parsing bd remember prose."
+}
