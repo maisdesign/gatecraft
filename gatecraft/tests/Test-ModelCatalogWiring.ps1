@@ -31,6 +31,11 @@ function Assert-Equal {
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('gatecraft-model-catalog-wiring-' + [Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($testRoot)
+# Clean up the scratch fixture directory even on an unexpected terminating
+# error, not only the normal exit path below (review finding, codex/lavoro:
+# an earlier version left 9 residual directories in %TEMP% after repeated
+# runs, including on error paths).
+trap { if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue } }
 
 function Write-CatalogFixture {
     param([string] $GeneratedAt, [switch] $Malformed)
@@ -140,6 +145,8 @@ else {
         }
     }
 }
+
+if ([IO.Directory]::Exists($testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { [Console]::Error.WriteLine("ASSERTION FAILED: $failure") }
