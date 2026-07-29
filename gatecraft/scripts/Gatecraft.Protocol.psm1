@@ -1867,6 +1867,7 @@ function Resolve-GatecraftRetrySequence {
 Export-ModuleMember -Function @(
     'Protect-GatecraftText',
     'ConvertFrom-GatecraftReceiptLine',
+    'Test-GatecraftIso8601',
     'Test-GatecraftRecoveryRecord',
     'ConvertTo-GatecraftRecoveryProjection',
     'Test-GatecraftVerificationChain',
