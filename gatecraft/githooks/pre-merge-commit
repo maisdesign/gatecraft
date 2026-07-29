@@ -1,0 +1,44 @@
+#!/bin/sh
+
+# gatecraft pre-merge-commit hook (gatecraft-7dq).
+#
+# Converts enforce-gate.ps1's check-merge from a separate step an
+# orchestrator can forget to call into an automatic side-effect of the
+# merge itself: git invokes this hook after conflict-free merge resolution
+# but BEFORE the merge commit is created, and a nonzero exit here aborts
+# the merge commit outright (git leaves MERGE_HEAD in place, exactly like
+# an unresolved-conflict merge, requiring `git merge --abort` or a fix).
+#
+# Honest scope, stated once here rather than assumed: this only fires when
+# the orchestrator has marked the merge as its own by exporting
+# GATECRAFT_BEAD_ID first. An unmarked merge (an ordinary human/dev
+# `git merge` unrelated to gatecraft orchestration) is never touched --
+# enforcing unconditionally on every merge into this repo would break
+# normal git usage, which this hook must not do. This narrows the original
+# gap from "remember to run a whole separate command" down to "remember to
+# export one environment variable before merging" -- a real reduction, not
+# a mathematically airtight one; an orchestrator that forgets the env var
+# still merges unchecked, same as before this hook existed.
+if [ -z "$GATECRAFT_BEAD_ID" ]; then
+    exit 0
+fi
+
+hook_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P) || exit 1
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+enforce_gate="$hook_dir/../scripts/enforce-gate.ps1"
+
+if ! command -v pwsh >/dev/null 2>&1; then
+    echo "gatecraft pre-merge-commit: pwsh not found on PATH -- refusing to merge with GATECRAFT_BEAD_ID set (fail closed)." >&2
+    exit 1
+fi
+
+if [ -n "$GATECRAFT_ARTIFACT_SHA" ] && [ -n "$GATECRAFT_LOW_RISK_NO_REVIEW_REQUIRED" ]; then
+    pwsh -NoLogo -NoProfile -File "$enforce_gate" check-merge --repository-root "$repo_root" --bead-id "$GATECRAFT_BEAD_ID" --artifact-sha "$GATECRAFT_ARTIFACT_SHA" --low-risk-no-review-required
+elif [ -n "$GATECRAFT_ARTIFACT_SHA" ]; then
+    pwsh -NoLogo -NoProfile -File "$enforce_gate" check-merge --repository-root "$repo_root" --bead-id "$GATECRAFT_BEAD_ID" --artifact-sha "$GATECRAFT_ARTIFACT_SHA"
+elif [ -n "$GATECRAFT_LOW_RISK_NO_REVIEW_REQUIRED" ]; then
+    pwsh -NoLogo -NoProfile -File "$enforce_gate" check-merge --repository-root "$repo_root" --bead-id "$GATECRAFT_BEAD_ID" --low-risk-no-review-required
+else
+    pwsh -NoLogo -NoProfile -File "$enforce_gate" check-merge --repository-root "$repo_root" --bead-id "$GATECRAFT_BEAD_ID"
+fi
+exit $?

@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# gatecraft pre-push hook (gatecraft-7dq).
+#
+# Converts enforce-gate.ps1's check-push from a separate step an
+# orchestrator can forget to call into an automatic side-effect of the
+# push itself: git invokes this hook before any objects are transferred,
+# and a nonzero exit here aborts the push entirely (nothing reaches the
+# remote).
+#
+# Honest scope: this only fires when GATECRAFT_AUTOMATED_PUSH=1 is set --
+# i.e. the orchestrator is about to push as its OWN automated decision. A
+# push the user directly typed or explicitly approved is not "automated"
+# in the 0.9 policy sense and must never be blocked by this hook; without
+# that variable, every push (human or otherwise) goes through untouched.
+# Same honest limitation as pre-merge-commit: an orchestrator that forgets
+# to set the variable before an automated push bypasses this check, same
+# as before this hook existed -- the reduction is from "remember a whole
+# separate command" to "remember one environment variable."
+if [ -z "$GATECRAFT_AUTOMATED_PUSH" ]; then
+    exit 0
+fi
+
+hook_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P) || exit 1
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+enforce_gate="$hook_dir/../scripts/enforce-gate.ps1"
+
+if ! command -v pwsh >/dev/null 2>&1; then
+    echo "gatecraft pre-push: pwsh not found on PATH -- refusing to push with GATECRAFT_AUTOMATED_PUSH set (fail closed)." >&2
+    exit 1
+fi
+
+zero_sha="0000000000000000000000000000000000000000"
+status=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ -z "$local_ref" ] || [ "$local_sha" = "$zero_sha" ]; then
+        continue
+    fi
+    branch=$(printf '%s' "$local_ref" | sed -e 's|^refs/heads/||')
+    pwsh -NoLogo -NoProfile -File "$enforce_gate" check-push --repository-root "$repo_root" --target "$branch"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        status=$rc
+    fi
+done
+exit $status
