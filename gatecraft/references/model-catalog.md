@@ -64,11 +64,20 @@ definitions — and classifies the outcome:
 | `permanent` + `usable=true` | The lane accepted a worker-sized request | Catalogue it |
 | `permanent` + `lane-rejected` | Rejected on its own terms (413, 400, …) | Leave it out |
 | `transient` | Rate limit, cooldown, upstream fault, timeout | Unknown — never exclude on this |
+| `transient` + `lane-queue-budget` | OmniRoute dropped the request from its own queue | Unknown — raise the budget, then re-probe |
 | `blocked` | `probe-unauthorized` / `probe-key-missing` | The credential, not the model; the run stops |
 
 The `transient`/`permanent` split is the point. A `429 all credentials are cooling down` was
 observed on a lane that worked minutes later: treating it as a rejection would permanently
 blacklist a good lane over a temporary limit. Only `permanent` verdicts are evidence.
+
+`lane-queue-budget` deserves its own code because the symptom is misleading. OmniRoute drops a
+request that waited longer than its own local rate-limit queue budget and reports it as a `502`,
+which reads as an upstream fault on the model. The default budget is 15s — tight for a free tier,
+where a worker-sized request routinely takes longer — so a healthy lane can look broken when only
+that setting is. Raise `requestQueue.maxWaitMs` in the OmniRoute dashboard under
+Settings → Resilience (or via `RATE_LIMIT_MAX_WAIT_MS`) and probe again. Gatecraft reports this and
+stops there: changing a gateway setting is a reconfiguration, which stays the user's decision.
 
 **Warn the user before starting: this is slow.** The probes run serially and paced on purpose —
 each one is a full-size request, and on a free tier a single probe can take minutes. Running them
