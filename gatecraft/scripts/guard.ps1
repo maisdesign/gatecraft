@@ -314,14 +314,21 @@ function Resolve-ProcessLifecycle {
         if (-not [Gatecraft.NativeProcess]::GetProcessTimes($handle, [ref]$creation, [ref]$exitTime, [ref]$kernelTime, [ref]$userTime)) { throw $FailClosedCode }
         $actualStart = [DateTime]::FromFileTimeUtc($creation).ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
         if ($actualStart -cne $ExpectedStart) { throw $FailClosedCode }
-        [uint32]$exitCode = 0
-        if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw $FailClosedCode }
-        if ($exitCode -eq 259) {  # STILL_ACTIVE
+        # Liveness is decided by the handle's own wait-signal state (WaitForSingleObject with a zero
+        # timeout), never by the exit-code VALUE. GetExitCodeProcess returning 259 is ambiguous by Windows'
+        # own contract: a process reports 259 both while genuinely still running (STILL_ACTIVE) AND, with
+        # equal legitimacy, after it has already exited if 259 happens to be the real exit code the process
+        # chose (external review round 21 finding -- round 20's own exit-code-259 check could not tell
+        # these apart and fails closed with a false "still alive" on an already-dead process whose real exit
+        # code is 259). WAIT_OBJECT_0 (a zero-timeout wait returns immediately, non-blocking) is unambiguous:
+        # the OS only reports it once the process object is actually signaled, i.e. genuinely terminated,
+        # regardless of what exit-code value it happens to report.
+        $waitResult = [Gatecraft.NativeProcess]::WaitForSingleObject($handle, 0)
+        if ($waitResult -eq 258) {  # WAIT_TIMEOUT: not yet signaled -- genuinely still running.
             [void][Gatecraft.NativeProcess]::TerminateProcess($handle, 1)
             if ([Gatecraft.NativeProcess]::WaitForSingleObject($handle, 5000) -ne 0) { throw $FailClosedCode }  # not WAIT_OBJECT_0
-            if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($handle, [ref]$exitCode)) { throw $FailClosedCode }
-            if ($exitCode -eq 259) { throw $FailClosedCode }
         }
+        elseif ($waitResult -ne 0) { throw $FailClosedCode }  # neither signaled nor a clean timeout -- unverifiable, fail closed.
         $succeeded = $true
         return [pscustomobject]@{ ProcessId = $ProcessId; Start = $actualStart; Handle = $handle }
     }
@@ -577,9 +584,12 @@ function Stop-DescendantProcesses {
                 # this candidate during discovery above -- never reopen/re-resolve this PID by number, the
                 # same discipline Resolve-ProcessLifecycle applies to the root.
                 [void][Gatecraft.NativeProcess]::TerminateProcess($descendant.Handle, 1)
+                # WaitForSingleObject returning WAIT_OBJECT_0 is itself the termination proof (the handle's
+                # wait-signal state, not any exit-code value -- see Resolve-ProcessLifecycle's own comment on
+                # why exit-code 259 cannot disambiguate "still running" from "really exited with that exact
+                # code", external review round 21). A GetExitCodeProcess()==259 recheck here would reject an
+                # already-confirmed-dead descendant purely because 259 happens to be its real exit code.
                 if ([Gatecraft.NativeProcess]::WaitForSingleObject($descendant.Handle, 5000) -ne 0) { throw 'worktree-holder-descendant-alive' }
-                [uint32]$exitCode = 0
-                if (-not [Gatecraft.NativeProcess]::GetExitCodeProcess($descendant.Handle, [ref]$exitCode) -or $exitCode -eq 259) { throw 'worktree-holder-descendant-alive' }
                 $stoppedAny = $true
             }
             if (-not $discoveredNew) { break }
