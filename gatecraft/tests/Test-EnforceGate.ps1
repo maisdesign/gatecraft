@@ -32,6 +32,18 @@ function Assert-Equal {
 # `exit` calls in the dispatcher never fire here and this test process is safe.
 . $enforceGateScript
 
+# --- --receipt-file must be rejected WITHOUT GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1 (checked before setting it below for the rest of this file) ---
+$env:GATECRAFT_ENFORCE_GATE_TEST_CONTROLS = $null
+$disabledReceiptFilePath = Join-Path $testRoot ('disabled-receipt-' + [Guid]::NewGuid().ToString('N') + '.txt')
+'VERIFY_PHASE protocol=verification/v2 receipt_id=x phase=baseline verified_by=v verified_at=2026-07-15T10:00:00Z artifact_sha=' + ('a' * 64) + ' gate="g" exit=0 result=observed required="" evidence=""' | Set-Content -LiteralPath $disabledReceiptFilePath -Encoding utf8
+$disabledReceiptFile = Get-ReceiptLinesForCheck -ReceiptFile $disabledReceiptFilePath -RepositoryRoot $testRoot
+Assert-True (-not $disabledReceiptFile.Ok) '--receipt-file must be rejected without GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1.'
+Assert-Equal $disabledReceiptFile.Code 'argument-receipt-file-test-only' 'Disabled --receipt-file must report argument-receipt-file-test-only.'
+
+# The remainder of this file deliberately exercises --receipt-file, so enable
+# it for the rest of this in-process test run.
+$env:GATECRAFT_ENFORCE_GATE_TEST_CONTROLS = '1'
+
 function New-TestRepository {
     param([string] $Name)
     $path = Join-Path $testRoot $Name
@@ -61,13 +73,15 @@ function Write-ReceiptFile {
 }
 
 function Invoke-EnforceGateProcess {
-    param([string[]] $Arguments, [int] $TimeoutMilliseconds = 30000)
+    param([string[]] $Arguments, [int] $TimeoutMilliseconds = 30000, [bool] $TestControls = $false)
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = $pwshPath
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    if ($TestControls) { $info.Environment['GATECRAFT_ENFORCE_GATE_TEST_CONTROLS'] = '1' }
+    else { [void]$info.Environment.Remove('GATECRAFT_ENFORCE_GATE_TEST_CONTROLS') }
     $info.ArgumentList.Add('-NoLogo')
     $info.ArgumentList.Add('-NoProfile')
     $info.ArgumentList.Add('-File')
@@ -231,13 +245,34 @@ $badCommandResult = Invoke-EnforceGateProcess -Arguments @('bogus-command', '--r
 Assert-Equal $badCommandResult.ExitCode 64 'Unknown command must exit 64.'
 Assert-True ($badCommandResult.Error -match 'code=argument-command-invalid') 'Unknown command must name its exact code.'
 
-$realLockNotHeldResult = Invoke-EnforceGateProcess -Arguments @('check-merge', '--repository-root', $noLockRepo, '--receipt-file', $withBaselineFile, '--low-risk-no-review-required')
+$realLockNotHeldResult = Invoke-EnforceGateProcess -Arguments @('check-merge', '--repository-root', $noLockRepo, '--receipt-file', $withBaselineFile, '--low-risk-no-review-required') -TestControls $true
 Assert-Equal $realLockNotHeldResult.ExitCode 73 'A real subprocess with no held lock must exit 73.'
 Assert-True ($realLockNotHeldResult.Error -match 'code=lock-not-held') 'A real subprocess with no held lock must name lock-not-held.'
 
 $realPushManualOnlyResult = Invoke-EnforceGateProcess -Arguments @('check-push', '--repository-root', $manualOnlyRepo, '--target', 'main')
 Assert-Equal $realPushManualOnlyResult.ExitCode 77 'A real subprocess under manual-only policy must exit 77.'
 Assert-True ($realPushManualOnlyResult.Error -match 'code=push-manual-only') 'A real subprocess under manual-only policy must name push-manual-only.'
+
+# --- --receipt-file must be rejected end-to-end (real subprocess) without GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1 ---
+# Uses check-close (no local-guard precondition) so this isolates the
+# receipt-file gate itself, rather than tripping the lock check first --
+# a real subprocess's own PID never matches a holder.json written by the
+# test-runner process, so check-merge can't reach this path via subprocess.
+$realDisabledReceiptFileResult = Invoke-EnforceGateProcess -Arguments @('check-close', '--repository-root', $noLockRepo, '--receipt-file', $withBaselineFile) -TestControls $false
+Assert-Equal $realDisabledReceiptFileResult.ExitCode 64 'A real subprocess must reject --receipt-file at exit 64 without the test-controls env var.'
+Assert-True ($realDisabledReceiptFileResult.Error -match 'code=argument-receipt-file-test-only') 'Disabled --receipt-file must name argument-receipt-file-test-only end-to-end too.'
+
+# --- REVIEW_PASS must be validated semantically, not just grammatically (review round 2 finding, codex/lavoro) ---
+$forgedArtifactSha = 'E' * 64
+$forgedReviewFile = Write-ReceiptFile -Lines @($baselineLine, "REVIEW_PASS protocol=evil receipt_id=review-forged reviewer=r reviewed_at=not-a-date source_id=s review_id=rv artifact_sha=$forgedArtifactSha")
+$mergeForgedReview = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $forgedReviewFile -ArtifactSha $forgedArtifactSha
+Assert-True (-not $mergeForgedReview.Ok) 'A structurally-parseable but semantically-invalid REVIEW_PASS (wrong protocol, garbage timestamp) must not satisfy check-merge.'
+Assert-Equal $mergeForgedReview.Code 'review-missing-for-artifact' 'A forged REVIEW_PASS must report review-missing-for-artifact, the same as a genuinely absent one.'
+
+# --- --artifact-sha itself must be validated for shape ---
+$mergeMalformedArtifactSha = Invoke-CheckMerge -RepositoryRoot $heldRepo -ReceiptFile $withBaselineFile -ArtifactSha 'not-a-real-sha'
+Assert-True (-not $mergeMalformedArtifactSha.Ok) 'A malformed --artifact-sha must be rejected.'
+Assert-Equal $mergeMalformedArtifactSha.Code 'argument-artifact-sha-malformed' 'Malformed --artifact-sha must report argument-artifact-sha-malformed.'
 
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { [Console]::Error.WriteLine("ASSERTION FAILED: $failure") }

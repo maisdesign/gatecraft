@@ -45,10 +45,17 @@ gatecraft-push-policy/v1). mode=manual-only always fails closed (matches
 policy, no matter the target). mode=branch-only requires --target to exactly
 match the configured authorized_branch.
 
---receipt-file is test-only wiring: reads receipt lines from a plain UTF-8
-file (one candidate line per line) instead of fetching bd comments, so
-Test-EnforceGate.ps1 can exercise this script deterministically without a
-live bd database. Production callers pass --bead-id.
+--receipt-file is test-only wiring, gated behind
+GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1 the same way scripts/guard.ps1 gates
+its own test-only surfaces (review round 2 finding, codex/lavoro: an
+ungated --receipt-file let any caller substitute a fabricated file for real
+bd state, defeating the whole mechanism's anti-forgery purpose). Without
+that variable set to exactly '1' it fails closed with
+argument-receipt-file-test-only regardless of what path is given. When
+enabled, it reads receipt lines from a plain UTF-8 file (one candidate line
+per line) instead of fetching bd comments, so Test-EnforceGate.ps1 can
+exercise this script deterministically without a live bd database.
+Production callers never set that variable and always pass --bead-id.
 '@)
 }
 
@@ -157,6 +164,15 @@ function Get-BeadReceiptLines {
 function Get-ReceiptLinesForCheck {
     param([string] $BeadId, [string] $ReceiptFile, [string] $RepositoryRoot)
     if ($ReceiptFile) {
+        # Test-only surface, gated the same way guard.ps1 gates its own
+        # test-only knobs (review round 2 finding, codex/lavoro): without this,
+        # any production caller could pass a fabricated file instead of
+        # --bead-id and satisfy check-merge/check-close against content that
+        # was never actually recorded on the real bead -- a bypass of the
+        # entire mechanism's anti-forgery purpose, not just a convenience.
+        if ([Environment]::GetEnvironmentVariable('GATECRAFT_ENFORCE_GATE_TEST_CONTROLS', [EnvironmentVariableTarget]::Process) -cne '1') {
+            return [pscustomobject]@{ Ok = $false; Code = 'argument-receipt-file-test-only'; Detail = '--receipt-file requires GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1; production callers must pass --bead-id and read real bd state.'; Value = @() }
+        }
         if (-not (Test-Path -LiteralPath $ReceiptFile -PathType Leaf)) {
             return [pscustomobject]@{ Ok = $false; Code = 'argument-receipt-file-missing'; Detail = "--receipt-file '$ReceiptFile' does not exist."; Value = @() }
         }
@@ -178,6 +194,7 @@ function Invoke-CheckMerge {
 
     if (-not $BeadId -and -not $ReceiptFile) { return [pscustomobject]@{ Ok = $false; Code = 'argument-bead-id-or-receipt-file-required' } }
     if (-not $LowRiskNoReviewRequired -and -not $ArtifactSha) { return [pscustomobject]@{ Ok = $false; Code = 'argument-artifact-sha-required'; Detail = 'Review is required by default; pass --artifact-sha to bind it to the exact merge candidate, or explicitly opt out with --low-risk-no-review-required.' } }
+    if ($ArtifactSha -and $ArtifactSha -cnotmatch '^[0-9A-F]{64}$') { return [pscustomobject]@{ Ok = $false; Code = 'argument-artifact-sha-malformed'; Detail = '--artifact-sha must be exactly 64 uppercase hexadecimal characters.' } }
 
     $commonResult = Get-GitCommonDirectory -RepositoryRoot $RepositoryRoot
     if (-not $commonResult.Ok) { return $commonResult }
@@ -189,11 +206,23 @@ function Invoke-CheckMerge {
 
     $baselineFound = $false
     $reviewPassFound = $false
+    $identityPattern = '^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$'
     foreach ($line in $linesResult.Value) {
         $parsed = ConvertFrom-GatecraftReceiptLine -Line $line
         if (-not $parsed.IsValid) { continue }
         if ($parsed.Type -ceq 'VERIFY_PHASE' -and $parsed.Fields['phase'] -ceq 'baseline' -and $parsed.Fields['result'] -ceq 'observed') { $baselineFound = $true }
-        if (-not $LowRiskNoReviewRequired -and $parsed.Type -ceq 'REVIEW_PASS' -and $parsed.Fields['artifact_sha'] -ceq $ArtifactSha) { $reviewPassFound = $true }
+        if ($LowRiskNoReviewRequired -or $parsed.Type -cne 'REVIEW_PASS' -or $parsed.Fields['artifact_sha'] -cne $ArtifactSha) { continue }
+        # A REVIEW_PASS candidate must pass the SAME semantic checks
+        # Test-GatecraftVerificationChain applies to every receipt (review
+        # round 2 finding, codex/lavoro): ConvertFrom-GatecraftReceiptLine only
+        # validates grammar and field presence, so a structurally well-formed
+        # but forged line -- wrong protocol, garbage timestamp -- otherwise
+        # parsed as IsValid=true and satisfied this check on artifact_sha
+        # equality alone.
+        if ($parsed.Fields['protocol'] -cne 'verification/v2') { continue }
+        if (-not (Test-GatecraftIso8601 -Value $parsed.Fields['reviewed_at'])) { continue }
+        if ($parsed.Fields['reviewer'] -notmatch $identityPattern -or $parsed.Fields['source_id'] -notmatch $identityPattern -or $parsed.Fields['review_id'] -notmatch $identityPattern) { continue }
+        $reviewPassFound = $true
     }
     if (-not $baselineFound) {
         return [pscustomobject]@{ Ok = $false; Code = 'baseline-missing'; Detail = "No valid 'VERIFY_PHASE ... phase=baseline result=observed' receipt line found." }
