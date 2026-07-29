@@ -1,0 +1,7 @@
+# POSIX shell scripts must keep LF line endings regardless of a checkout
+# machine's core.autocrlf setting -- a CRLF-terminated shebang line can
+# break direct execution (git invokes hooks as executables, not through an
+# explicit `bash script.sh` wrapper that would otherwise mask this). Applies
+# to git's own hook files and every gatecraft *.sh entry-point wrapper.
+gatecraft/githooks/* text eol=lf
+gatecraft/scripts/*.sh text eol=lf
