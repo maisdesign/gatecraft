@@ -17,7 +17,7 @@ non-zero exit and a code naming exactly which artifact is missing, rather than
 silently letting the action through.
 
 check-merge requires: the local cooperative guard (scripts/guard.ps1) is
-currently held by THIS process (matched by PID + canonical process start
+currently held by a LIVE process (matched by PID + canonical process start
 against <git-common-dir>/gatecraft-local-guard-v1/holder.json); a valid
 VERIFY_PHASE phase=baseline result=observed receipt line exists for the bead;
 and, by DEFAULT, a REVIEW_PASS line bound to the exact --artifact-sha. Review
@@ -91,12 +91,16 @@ function Get-GitCommonDirectory {
     return [pscustomobject]@{ Ok = $true; Code = 'ok'; Detail = ''; Value = [IO.Path]::GetFullPath($common) }
 }
 
-function Get-CanonicalProcessStartForCurrentProcess {
-    $current = [Diagnostics.Process]::GetCurrentProcess()
-    return $current.StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+function Get-CanonicalProcessStart {
+    param([Parameter(Mandatory)][Diagnostics.Process] $Process)
+    return $Process.StartTime.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Test-LocalGuardHeldByCurrentProcess {
+function Get-CanonicalProcessStartForCurrentProcess {
+    return Get-CanonicalProcessStart -Process ([Diagnostics.Process]::GetCurrentProcess())
+}
+
+function Test-LocalGuardHeldByLiveProcess {
     param([Parameter(Mandatory)][string] $GitCommonDir)
     $holderPath = Join-Path (Join-Path $GitCommonDir 'gatecraft-local-guard-v1') 'holder.json'
     if (-not (Test-Path -LiteralPath $holderPath -PathType Leaf)) {
@@ -119,13 +123,24 @@ function Test-LocalGuardHeldByCurrentProcess {
             return [pscustomobject]@{ Ok = $false; Code = 'lock-record-unreadable'; Detail = "Holder record at $holderPath is missing a numeric 'pid' or a string 'process_start'." }
         }
         $holderPid = 0
-        if (-not $pidElement.TryGetInt32([ref] $holderPid) -or $holderPid -ne $PID) {
-            return [pscustomobject]@{ Ok = $false; Code = 'lock-not-held-by-current-process'; Detail = "Holder pid=$($pidElement.GetRawText()) does not match the current process (pid=$PID)." }
+        if (-not $pidElement.TryGetInt32([ref] $holderPid) -or $holderPid -le 0) {
+            return [pscustomobject]@{ Ok = $false; Code = 'lock-record-unreadable'; Detail = "Holder record at $holderPath has an invalid pid." }
         }
         $holderStart = $startElement.GetString()
-        $expectedStart = Get-CanonicalProcessStartForCurrentProcess
+        if ($holderStart -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$') {
+            return [pscustomobject]@{ Ok = $false; Code = 'lock-record-unreadable'; Detail = "Holder record at $holderPath has a non-canonical process_start." }
+        }
+        try { $holderProcess = [Diagnostics.Process]::GetProcessById($holderPid) }
+        catch [ArgumentException] {
+            return [pscustomobject]@{ Ok = $false; Code = 'lock-holder-process-dead'; Detail = "Holder pid=$holderPid is not live. Attended stale-lock recovery is required." }
+        }
+        try { $expectedStart = Get-CanonicalProcessStart -Process $holderProcess }
+        catch {
+            return [pscustomobject]@{ Ok = $false; Code = 'lock-holder-process-unreadable'; Detail = "Holder pid=$holderPid is live but its start time could not be read." }
+        }
+        finally { if ($null -ne $holderProcess) { $holderProcess.Dispose() } }
         if ($holderStart -cne $expectedStart) {
-            return [pscustomobject]@{ Ok = $false; Code = 'lock-not-held-by-current-process'; Detail = "Holder process_start=$holderStart does not match the current process's own start ($expectedStart)." }
+            return [pscustomobject]@{ Ok = $false; Code = 'lock-holder-process-mismatch'; Detail = "Holder process_start=$holderStart does not match live pid=$holderPid start ($expectedStart). Attended stale-lock recovery is required." }
         }
         return [pscustomobject]@{ Ok = $true; Code = 'ok'; Detail = '' }
     }
@@ -150,15 +165,21 @@ function Get-BeadReceiptLines {
         if ($null -eq $comment.text) { continue }
         foreach ($rawLine in ([string]$comment.text -split "`n")) {
             $trimmed = $rawLine.TrimEnd("`r")
-            # Only lines that look like a receipt prefix (matching the same
-            # `^[A-Z][A-Z_]*` shape ConvertFrom-GatecraftReceiptLine itself
-            # requires) are candidates; free-form prose in the same comment
-            # (the human-readable narrative around a ledger line) is not fed
-            # to the strict grammar validator at all.
-            if ($trimmed -match '^[A-Z][A-Z_]*\s') { $lines.Add($trimmed) }
+            # Only prefixes supported by Gatecraft.Protocol are receipts.
+            # A broad uppercase-token filter also captured ordinary historical
+            # comments such as "AUDIT ..." and made an otherwise valid bead
+            # permanently impossible to close.
+            if (Test-GatecraftReceiptCandidateLine -Line $trimmed) {
+                $lines.Add($trimmed)
+            }
         }
     }
     return [pscustomobject]@{ Ok = $true; Code = 'ok'; Detail = ''; Value = $lines.ToArray() }
+}
+
+function Test-GatecraftReceiptCandidateLine {
+    param([AllowEmptyString()][string] $Line)
+    return $Line -match '^(?:VERIFY_PHASE|VERIFIED|RECOVERY|REVIEW_PASS|REVIEW_BLOCK|REVIEW_INCONCLUSIVE|REVIEW_CLARIFY)\s'
 }
 
 function Get-ReceiptLinesForCheck {
@@ -198,7 +219,7 @@ function Invoke-CheckMerge {
 
     $commonResult = Get-GitCommonDirectory -RepositoryRoot $RepositoryRoot
     if (-not $commonResult.Ok) { return $commonResult }
-    $lockResult = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $commonResult.Value
+    $lockResult = Test-LocalGuardHeldByLiveProcess -GitCommonDir $commonResult.Value
     if (-not $lockResult.Ok) { return $lockResult }
 
     $linesResult = Get-ReceiptLinesForCheck -BeadId $BeadId -ReceiptFile $ReceiptFile -RepositoryRoot $RepositoryRoot

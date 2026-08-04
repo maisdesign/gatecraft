@@ -32,6 +32,13 @@ function Assert-Equal {
 # `exit` calls in the dispatcher never fire here and this test process is safe.
 . $enforceGateScript
 
+# Receipt discovery must not promote ordinary all-caps narrative into strict
+# protocol input.
+Assert-True (-not (Test-GatecraftReceiptCandidateLine -Line 'AUDIT DI ALLINEAMENTO')) 'Uppercase narrative must not be treated as a receipt candidate.'
+foreach ($prefix in @('VERIFY_PHASE', 'VERIFIED', 'RECOVERY', 'REVIEW_PASS', 'REVIEW_BLOCK', 'REVIEW_INCONCLUSIVE', 'REVIEW_CLARIFY')) {
+    Assert-True (Test-GatecraftReceiptCandidateLine -Line "$prefix protocol=verification/v2") "Supported receipt prefix $prefix must remain discoverable."
+}
+
 # --- --receipt-file must be rejected WITHOUT GATECRAFT_ENFORCE_GATE_TEST_CONTROLS=1 (checked before setting it below for the rest of this file) ---
 $env:GATECRAFT_ENFORCE_GATE_TEST_CONTROLS = $null
 $disabledReceiptFilePath = Join-Path $testRoot ('disabled-receipt-' + [Guid]::NewGuid().ToString('N') + '.txt')
@@ -103,10 +110,10 @@ function Invoke-EnforceGateProcess {
     finally { $process.Dispose() }
 }
 
-# --- Test-LocalGuardHeldByCurrentProcess: no holder file at all ---
+# --- Test-LocalGuardHeldByLiveProcess: no holder file at all ---
 $noLockRepo = New-TestRepository 'no-lock-repo'
 $noLockCommon = (Get-GitCommonDirectory -RepositoryRoot $noLockRepo).Value
-$noLock = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $noLockCommon
+$noLock = Test-LocalGuardHeldByLiveProcess -GitCommonDir $noLockCommon
 Assert-True (-not $noLock.Ok) 'Missing holder.json must fail the lock check.'
 Assert-Equal $noLock.Code 'lock-not-held' 'Missing holder.json must report lock-not-held.'
 
@@ -114,30 +121,56 @@ Assert-Equal $noLock.Code 'lock-not-held' 'Missing holder.json must report lock-
 $wrongPidRepo = New-TestRepository 'wrong-pid-repo'
 $wrongPidCommon = (Get-GitCommonDirectory -RepositoryRoot $wrongPidRepo).Value
 Write-HolderJson -GitDir $wrongPidCommon -ProcessId 999999999 -ProcessStart '2026-01-01T00:00:00.0000000Z'
-$wrongPid = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $wrongPidCommon
-Assert-True (-not $wrongPid.Ok) 'A holder naming a different PID must fail.'
-Assert-Equal $wrongPid.Code 'lock-not-held-by-current-process' 'Wrong-PID holder must report lock-not-held-by-current-process.'
+$wrongPid = Test-LocalGuardHeldByLiveProcess -GitCommonDir $wrongPidCommon
+Assert-True (-not $wrongPid.Ok) 'A holder naming a dead PID must fail.'
+Assert-Equal $wrongPid.Code 'lock-holder-process-dead' 'Dead-PID holder must report lock-holder-process-dead.'
 
 # --- holder.json names this exact process's PID but the wrong start time ---
 $wrongStartRepo = New-TestRepository 'wrong-start-repo'
 $wrongStartCommon = (Get-GitCommonDirectory -RepositoryRoot $wrongStartRepo).Value
 Write-HolderJson -GitDir $wrongStartCommon -ProcessId $PID -ProcessStart '2026-01-01T00:00:00.0000000Z'
-$wrongStart = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $wrongStartCommon
+$wrongStart = Test-LocalGuardHeldByLiveProcess -GitCommonDir $wrongStartCommon
 Assert-True (-not $wrongStart.Ok) 'A holder with this PID but the wrong start time must fail (PID-reuse discipline).'
-Assert-Equal $wrongStart.Code 'lock-not-held-by-current-process' 'Wrong-start holder must report lock-not-held-by-current-process.'
+Assert-Equal $wrongStart.Code 'lock-holder-process-mismatch' 'Wrong-start holder must report lock-holder-process-mismatch.'
 
 # --- holder.json genuinely matches this process (PID + canonical start) ---
 $heldRepo = New-TestRepository 'held-repo'
 $heldCommon = (Get-GitCommonDirectory -RepositoryRoot $heldRepo).Value
 $ownStart = Get-CanonicalProcessStartForCurrentProcess
 Write-HolderJson -GitDir $heldCommon -ProcessId $PID -ProcessStart $ownStart
-$held = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $heldCommon
+$held = Test-LocalGuardHeldByLiveProcess -GitCommonDir $heldCommon
 Assert-True $held.Ok 'A holder matching this exact process must pass.'
+
+# --- holder.json names a different, live long-lived host process ---
+# The orchestrator host owns the guard; enforce-gate normally runs in a short-lived
+# child pwsh. The gate must validate the holder's liveness and identity, not demand
+# ownership by whichever transient shell happens to invoke this check.
+$hostInfo = [Diagnostics.ProcessStartInfo]::new()
+$hostInfo.FileName = $pwshPath
+$hostInfo.UseShellExecute = $false
+$hostInfo.CreateNoWindow = $true
+$hostInfo.ArgumentList.Add('-NoLogo')
+$hostInfo.ArgumentList.Add('-NoProfile')
+$hostInfo.ArgumentList.Add('-Command')
+$hostInfo.ArgumentList.Add('Start-Sleep -Seconds 30')
+$hostProcess = [Diagnostics.Process]::new()
+$hostProcess.StartInfo = $hostInfo
+try {
+    Assert-True $hostProcess.Start() 'Could not start the long-lived holder fixture.'
+    $hostStart = Get-CanonicalProcessStart -Process $hostProcess
+    Write-HolderJson -GitDir $heldCommon -ProcessId $hostProcess.Id -ProcessStart $hostStart
+    $heldByHost = Test-LocalGuardHeldByLiveProcess -GitCommonDir $heldCommon
+    Assert-True $heldByHost.Ok 'A holder matching a different live long-lived host process must pass.'
+}
+finally {
+    if (-not $hostProcess.HasExited) { $hostProcess.Kill($true); $hostProcess.WaitForExit() }
+    $hostProcess.Dispose()
+}
 
 # --- malformed holder.json ---
 $malformedDir = Join-Path $heldCommon 'gatecraft-local-guard-v1'
 [IO.File]::WriteAllText((Join-Path $malformedDir 'holder.json'), '{not json')
-$malformed = Test-LocalGuardHeldByCurrentProcess -GitCommonDir $heldCommon
+$malformed = Test-LocalGuardHeldByLiveProcess -GitCommonDir $heldCommon
 Assert-True (-not $malformed.Ok) 'Malformed holder.json must fail.'
 Assert-Equal $malformed.Code 'lock-record-unreadable' 'Malformed holder.json must report lock-record-unreadable.'
 Write-HolderJson -GitDir $heldCommon -ProcessId $PID -ProcessStart $ownStart
